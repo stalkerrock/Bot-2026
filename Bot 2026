@@ -1,4 +1,4 @@
-```python
+python
 import asyncio
 import socket
 from telegram import Update, ReplyKeyboardMarkup
@@ -806,4 +806,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-```
