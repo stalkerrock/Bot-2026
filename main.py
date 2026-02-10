@@ -459,7 +459,7 @@ def main():
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
-    logging.info(f"Saving trade: {trade_data}")
+    logging.info("Saving trade: {}".format(trade_data))
     trade_history.append(trade_data)
     try:
         with open(TRADE_HISTORY_FILE, "w") as f:
