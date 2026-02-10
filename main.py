@@ -18,6 +18,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
+# Ключі з середовища
 API_KEY = os.environ.get('API_KEY')
 SECRET_KEY = os.environ.get('SECRET_KEY')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_API_KEY')
@@ -29,33 +30,38 @@ if not all([API_KEY, SECRET_KEY, TELEGRAM_TOKEN]):
 client = Client(API_KEY, SECRET_KEY)
 SYMBOL = "BTCUSDC"
 
+# Параметри MACD (1-хвилинний скальпінг)
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-AUTO_INTERVAL = 60  # 1 хвилина
+AUTO_INTERVAL = 60  # 60 секунд
 
 auto_trading_enabled = False
 trade_history = []
 HISTORY_FILE = "trade_history.json"
 
 
-def load_history():
+def load_trade_history():
     global trade_history
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r") as f:
                 trade_history = json.load(f)
-        except Exception:
+        except Exception as e:
+            logging.error(f"Помилка завантаження історії: {e}")
             trade_history = []
+    else:
+        logging.info("Файл історії не знайдено, починаємо з порожнього")
     logging.info(f"Завантажено {len(trade_history)} угод")
 
 
-def save_trade(data):
-    trade_history.append(data)
+def save_trade(trade_data):
+    global trade_history
+    trade_history.append(trade_data)
     try:
         with open(HISTORY_FILE, "w") as f:
             json.dump(trade_history, f, indent=2)
-        logging.info(f"Збережено: {data}")
+        logging.info(f"Збережено угоду: {trade_data}")
     except Exception as e:
         logging.error(f"Помилка збереження: {e}")
 
@@ -166,28 +172,29 @@ def execute_trade(side):
 
 
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info("Кнопка Купити")
+    logging.info("Кнопка Купити натиснута")
     await update.message.reply_text("Купівля...")
     result = await asyncio.to_thread(execute_trade, "BUY")
     await update.message.reply_text(result)
 
 
 async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info("Кнопка Продати")
+    logging.info("Кнопка Продати натиснута")
     await update.message.reply_text("Продаж...")
     result = await asyncio.to_thread(execute_trade, "SELL")
     await update.message.reply_text(result)
 
 
 async def check_and_trade(context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Запущено перевірку автотрейдингу")
+    
     if not auto_trading_enabled:
+        logging.info("Автотрейдинг вимкнено, пропускаємо")
         return
-
-    logging.info("Перевірка автотрейдингу")
 
     result = await asyncio.to_thread(get_macd_signal)
     if not result:
-        logging.warning("MACD не отримано")
+        logging.warning("MACD сигнал не отримано")
         return
 
     hist = result["histogram"]
@@ -231,10 +238,13 @@ async def toggle_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     job_queue = context.application.job_queue
 
+    # Видаляємо старі завдання
     for job in job_queue.get_jobs_by_name("auto"):
         job.schedule_removal()
+        logging.info("Видалено старе завдання")
 
     if auto_trading_enabled:
+        logging.info("Запускаємо автотрейдинг")
         job_queue.run_repeating(
             check_and_trade,
             interval=AUTO_INTERVAL,
