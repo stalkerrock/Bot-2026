@@ -4,7 +4,6 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
-import config
 from datetime import datetime, timedelta
 import json
 import os
@@ -66,30 +65,6 @@ def save_trade(trade_data):
     except IOError as e:
         logging.error(f"Error saving trade history to file: {e}")
 
-def get_seconds_to_next_20_minute():
-    now = datetime.now()
-    current_hour = now.hour
-    current_minute = now.minute
-    current_second = now.second
-    current_microsecond = now.microsecond
-
-    if current_minute < 20:
-        minutes_to_wait = 20 - current_minute
-    elif 20 <= current_minute < 40:
-        minutes_to_wait = 40 - current_minute
-    else:  # current_minute >= 40
-        minutes_to_wait = 60 - current_minute + 20
-        current_hour += 1
-        if current_hour >= 24:
-            current_hour = 0
-
-    seconds_to_wait = (minutes_to_wait * 60) - current_second - (current_microsecond / 1000000)
-    if seconds_to_wait <= 0:
-        seconds_to_wait += 1200  # Додаємо 20 хвилин до наступного циклу
-
-    logging.info(f"Seconds to next 20th minute: {seconds_to_wait}")
-    return seconds_to_wait
-
 def generate_candlestick_graph(klines, max_bars=5):
     if not klines:
         return "Свічки: (немає даних)"
@@ -109,7 +84,7 @@ def generate_candlestick_graph(klines, max_bars=5):
     if price_range == 0: 
         price_range = max_price if max_price != 0 else 1 
 
-    graph = ["<b>Свічки (1h):</b>"]
+    graph = ["<b>Свічки (1m):</b>"]
     for i, candle in enumerate(candles):
         open_price = float(candle[1])
         close_price = float(candle[4])
@@ -224,7 +199,6 @@ def get_macd_signal():
     logging.info("Calculating MACD signal...")
     for attempt in range(max_retries):
         try:
-            # 1-хвилинний інтервал
             start_time = int((datetime.now() - timedelta(minutes=100)).timestamp() * 1000)
             klines = client.get_klines(symbol=TRADE_SYMBOL, interval=Client.KLINE_INTERVAL_1MINUTE, limit=100, startTime=start_time)
             close_prices = [float(k[4]) for k in klines]
@@ -343,15 +317,12 @@ def get_symbol_filters_info():
                     break
             
             if not found_symbol_info:
-                logging.error(f"Symbol '{TRADE_SYMBOL}' not found in exchange info. Check available symbols in logs.")
-                raise ValueError(f"Symbol '{TRADE_SYMBOL}' not found in exchange info.")
+                raise ValueError(f"Symbol '{TRADE_SYMBOL}' not found.")
 
             filters_dict = {f['filterType']: f for f in found_symbol_info['filters']}
             
-            logging.info(f"Raw filters for '{TRADE_SYMBOL}': {json.dumps(found_symbol_info['filters'], indent=2)}")
-
             if 'NOTIONAL' not in filters_dict: 
-                raise ValueError(f"Filter 'NOTIONAL' (for minNotional) not found for {TRADE_SYMBOL}. Check your logs for available filter types.")
+                raise ValueError(f"Filter 'NOTIONAL' not found for {TRADE_SYMBOL}.")
             
             lot_size_filter = None
             if 'LOT_SIZE' in filters_dict:
@@ -360,7 +331,7 @@ def get_symbol_filters_info():
                 lot_size_filter = filters_dict['MARKET_LOT_SIZE']
             
             if not lot_size_filter:
-                raise ValueError(f"Neither 'LOT_SIZE' nor 'MARKET_LOT_SIZE' filter found for {TRADE_SYMBOL}. Check your logs for available filter types.")
+                raise ValueError(f"LOT_SIZE filter not found for {TRADE_SYMBOL}.")
             
             min_notional_filter = filters_dict['NOTIONAL']
 
@@ -378,8 +349,7 @@ def get_symbol_filters_info():
                 current_filters['quantityPrecision'] = 0 
 
             symbol_filters[TRADE_SYMBOL] = current_filters
-            logging.info(f"Successfully retrieved symbol filters for {TRADE_SYMBOL}: {symbol_filters[TRADE_SYMBOL]}")
-            return symbol_filters[TRADE_SYMBOL]
+            return current_filters
         except Exception as e:
             logging.error(f"Attempt {attempt + 1}/{max_retries} failed to get symbol filters for {TRADE_SYMBOL}: {str(e)}")
             if attempt < max_retries - 1:
@@ -455,17 +425,15 @@ async def toggle_auto_trading(update: Update, context: ContextTypes.DEFAULT_TYPE
         job.schedule_removal()
 
     if auto_trading_enabled:
-        delay_to_first_execution = 10  # через 10 секунд перша перевірка
-        
-        logging.info(f"Scheduling auto trading to start after {delay_to_first_execution} seconds with interval {AUTO_TRADE_INTERVAL} seconds")
+        logging.info(f"Scheduling auto trading to start after 10 seconds with interval {AUTO_TRADE_INTERVAL} seconds")
         job_queue.run_repeating(
             check_macd_and_trade,
             interval=AUTO_TRADE_INTERVAL,
-            first=delay_to_first_execution,
+            first=10,
             name="auto_trading",
             data={"chat_id": update.effective_chat.id}
         )
-        await update.message.reply_text(f"✅ Автотрейдинг увімкнено!\nПерша перевірка через 10 секунд. Наступні перевірки кожну хвилину.")
+        await update.message.reply_text(f"✅ Автотрейдинг увімкнено!\nПеревірка кожну хвилину.")
     else:
         logging.info("Auto trading disabled")
         await update.message.reply_text("⛔ Автотрейдинг вимкнено")
@@ -482,7 +450,6 @@ def execute_market_trade(side: str):
         max_qty = filters_info['maxQty']
         step_size = filters_info['stepSize']
         qty_precision = filters_info['quantityPrecision']
-        logging.info(f"Filters retrieved: minNotional={min_notional}, minQty={min_qty}, maxQty={max_qty}, stepSize={step_size}, qtyPrecision={qty_precision}")
     except Exception as e:
         logging.error(f"Failed to get symbol filters in execute_market_trade: {e}")
         return f"Помилка торгівлі: Не вдалося отримати фільтри символу: {str(e)}"
@@ -493,53 +460,33 @@ def execute_market_trade(side: str):
                 balance_info = client.get_account()
                 usdc_balance_info = next((asset for asset in balance_info['balances'] if asset['asset'] == "USDC"), None)
                 usdc_balance = Decimal(usdc_balance_info['free']) if usdc_balance_info else Decimal('0')
-                logging.info(f"USDC balance for BUY: {usdc_balance}")
 
                 current_price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
                 current_price = Decimal(current_price_info['price'])
-                logging.info(f"Current price for BUY: {current_price}")
 
                 if usdc_balance < min_notional:
-                    logging.warning(f"Balance {usdc_balance} is less than min_notional {min_notional} for BUY.")
-                    return f"Balance {usdc_balance:.2f} USDC is below minimum notional {min_notional:.2f} USDC for BUY."
+                    return f"Баланс {usdc_balance:.2f} USDC нижче мінімуму {min_notional:.2f} USDC"
 
                 amount_to_spend = usdc_balance
 
                 if current_price <= 0:
-                    logging.error("Current price for BUY is zero or negative.")
-                    return "Помилка: Поточна ціна BTC є нульовою або від'ємною."
+                    return "Помилка: Поточна ціна нульова або від'ємна"
 
-                quantity_btc_raw = amount_to_spend / current_price
+                quantity_raw = amount_to_spend / current_price
 
                 rounding_precision = Decimal('1E-%d' % qty_precision)
+                quantity_decimal = (quantity_raw / step_size).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_size
+                quantity_decimal = quantity_decimal.quantize(rounding_precision, rounding=ROUND_DOWN)
 
-                quantity_btc_decimal = (quantity_btc_raw / step_size).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_size
-                quantity_decimal = quantity_btc_decimal.quantize(rounding_precision, rounding=ROUND_DOWN)
+                if quantity_decimal < min_qty:
+                    return f"Кількість {quantity_decimal:.8f} нижче мінімуму {min_qty}"
 
-                if quantity_btc_decimal < min_qty:
-                    calculated_min_notional = min_qty * current_price
-                    if calculated_min_notional < min_notional:
-                        return f"⚠️ Розрахована кількість ({quantity_btc_decimal:.{qty_precision}f} BTC) замала навіть для мінімального ордеру ({min_qty:.{qty_precision}f} BTC * {current_price:.2f} = {calculated_min_notional:.2f} USDC), що менше {min_notional:.2f} USDC"
-                    return f"⚠️ Розрахована кількість {quantity_btc_decimal:.{qty_precision}f} BTC нижче мінімуму {min_qty}, і навіть мінімальний ордер ({min_qty:.{qty_precision}f} BTC * {current_price:.2f} = {calculated_min_notional:.2f} USDC) менший за {min_notional:.2f} USDC"
-                    quantity_btc_decimal = min_qty
-
-                if quantity_btc_decimal > max_qty:
-                    return f"⚠️ Розрахована кількість {quantity_btc_decimal:.4f} перевищує максимум {max_qty}"
+                if quantity_decimal > max_qty:
+                    return f"Кількість {quantity_decimal:.8f} перевищує максимум {max_qty}"
 
                 calculated_notional = quantity_decimal * current_price
                 if calculated_notional < min_notional:
-                    return f"⚠️ Розрахована вартість купівлі ({calculated_notional:.2f} USDC) нижче за мінімальний номінал ордеру ({min_notional:.2f} USDC)"
-
-                if quantity_decimal <= 0:
-                    return "⚠️ Розрахована кількість для купівлі є нульовою або від'ємною."
-
-                logging.info(f"Attempting to place BUY order for {TRADE_SYMBOL} with parameters: "
-                             f"quantity={quantity_decimal:.{qty_precision}f}, "
-                             f"minQty={min_qty}, maxQty={max_qty}, stepSize={step_size}, "
-                             f"qtyPrecision={qty_precision}, "
-                             f"minNotional={min_notional}, currentPrice={current_price}, "
-                             f"usdc_balance={usdc_balance}, "
-                             f"calculated_notional={calculated_notional}")
+                    return f"Сума ордера {calculated_notional:.2f} нижче мінімуму {min_notional:.2f}"
 
                 order = client.create_order(
                     symbol=TRADE_SYMBOL,
@@ -559,45 +506,29 @@ def execute_market_trade(side: str):
                 }
                 last_buy_price = trade_data["price"]
                 save_trade(trade_data)
-                logging.info(f"Buy order executed: {trade_data}")
                 return f"🟢 Купівля: {trade_data['amount']:.8f} BTC за {trade_data['price']:.2f} USDC"
 
             elif side == "SELL":
                 balance_info = client.get_account()
                 btc_balance_info = next((asset for asset in balance_info['balances'] if asset['asset'] == "BTC"), None)
                 btc_balance = Decimal(btc_balance_info['free']) if btc_balance_info else Decimal('0')
-                logging.info(f"BTC balance for SELL: {btc_balance}")
 
                 if btc_balance < min_qty:
-                    logging.warning(f"BTC balance {btc_balance} is less than minQty {min_qty} for SELL.")
-                    return f"⚠️ Недостатньо BTC для продажу. Мінімальна кількість: {min_qty:.8f}. У вас: {btc_balance:.8f}"
+                    return f"Недостатньо BTC: {btc_balance:.8f} (мін. {min_qty})"
 
                 rounding_precision = Decimal('1E-%d' % qty_precision)
+                quantity_decimal = (btc_balance / step_size).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_size
+                quantity_decimal = quantity_decimal.quantize(rounding_precision, rounding=ROUND_DOWN)
 
-                quantity_btc_decimal = (btc_balance / step_size).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_size
-                quantity_decimal = quantity_btc_decimal.quantize(rounding_precision, rounding=ROUND_DOWN)
-
-                if quantity_btc_decimal > max_qty:
-                    return f"⚠️ Розрахована кількість {quantity_btc_decimal:.2f} перевищує максимум {max_qty}"
-
-                if quantity_decimal <= 0:
-                    return "⚠️ Розрахована кількість для продажу є нульовою."
+                if quantity_decimal > max_qty:
+                    return f"Кількість перевищує максимум {max_qty}"
 
                 current_price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
                 current_price = Decimal(current_price_info['price'])
-                logging.info(f"Current price for SELL: {current_price}")
 
                 calculated_notional = quantity_decimal * current_price
                 if calculated_notional < min_notional:
-                    return f"⚠️ Розрахована вартість продажу ({calculated_notional:.2f} USDC) менша за мінімальний номінал ордеру ({min_notional:.2f} USDC)."
-
-                logging.info(f"Attempting to place SELL order for {TRADE_SYMBOL} with parameters: "
-                             f"quantity={quantity_decimal:.{qty_precision}f}, "
-                             f"minQty={min_qty}, maxQty={max_qty}, stepSize={step_size}, "
-                             f"qtyPrecision={qty_precision}, "
-                             f"minNotional={min_notional}, currentPrice={current_price}, "
-                             f"btcBalance={btc_balance}, "
-                             f"calculatedNotional={calculated_notional:.4f}")
+                    return f"Сума ордера {calculated_notional:.2f} нижче мінімуму {min_notional:.2f}"
 
                 order = client.create_order(
                     symbol=TRADE_SYMBOL,
@@ -617,11 +548,10 @@ def execute_market_trade(side: str):
                 }
                 save_trade(trade_data)
                 last_buy_price = None
-                logging.info(f"Sell order executed: {trade_data}")
                 return f"🔴 Продаж: {trade_data['amount']:.8f} BTC за {trade_data['price']:.2f} USDC"
 
         except Exception as e:
-            logging.error(f"Attempt {attempt + 1}/{max_retries} failed for trade: {str(e)}")
+            logging.error(f"Attempt {attempt + 1} failed: {str(e)}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
             else:
@@ -652,18 +582,17 @@ async def check_macd_and_trade(context: ContextTypes.DEFAULT_TYPE):
         return
 
     signal_action = result["signal"]
-    trade_message = None
-
     histogram_value = result["histogram"][-1] if result["histogram"] else 0
     
+    trade_message = None
+
     if signal_action == "BUY" and histogram_value >= 0:
-        logging.info("MACD BUY signal detected (гістограма ≥ 0)!")
+        logging.info("MACD BUY signal detected")
         trade_message = execute_market_trade("BUY")
     elif signal_action == "SELL" and histogram_value < 0:
-        logging.info("MACD SELL signal detected (гістограма < 0)!")
+        logging.info("MACD SELL signal detected")
         trade_message = execute_market_trade("SELL")
     else:
-        logging.info(f"Автотрейдинг: Сигнал не відповідає умовам. Signal: {signal_action}, Histogram: {histogram_value}")
         return
 
     if trade_message:
@@ -674,7 +603,7 @@ async def check_macd_and_trade(context: ContextTypes.DEFAULT_TYPE):
         response_parts = [
             f"<b>Автотрейдинг ({datetime.now().strftime('%H:%M:%S')}):</b>",
             f"<b>{TRADE_SYMBOL} @ {current_price:.2f} USDC</b>",
-            f"<b>MACD гістограма (1хв): {hist_color_emoji} {histogram_value:.4f}</b>",
+            f"<b>MACD гістограма (1м): {hist_color_emoji} {histogram_value:.4f}</b>",
             f"Тренд: {result['trend']}",
             f"Сигнал: {signal_action}",
             f"Результат торгівлі: {trade_message}"
@@ -692,12 +621,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(trade_keyboard, resize_keyboard=True)
     await update.message.reply_text(
         "🔷 Торгівельний бот Binance\n\n"
-        "🤖 Автотрейдинг - автоматичні угоди за сигналами MACD (1хв)\n"
+        "🤖 Автотрейдинг - автоматичні угоди за сигналами MACD (1м)\n"
         "📊 MACD сигнал - перевірка поточного стану\n"
         "🟢 Купити BTC - купівля BTC за всю суму USDC за ринковою ціною\n"
         "🔴 Продати BTC - продаж усього BTC за ринковою ціною\n"
         "📊 Статистика - показує історію торгів\n\n"
-        "Оберіть дію:\n(Якщо кнопки не оновилися, введіть /refresh для оновлення клавіатури)",
+        "Оберіть дію:",
         reply_markup=reply_markup
     )
 
