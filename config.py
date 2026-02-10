@@ -1,0 +1,3 @@
+```python
+TELEGRAM_API_KEY = "7795357191:AAFyesKdhD0VLpsC9-RAZRj0VS5DS7Tip-k"
+```
