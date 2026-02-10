@@ -56,12 +56,410 @@ def load_trade_history():
         else:
             trade_history = []
     except Exception as e:
-        logging.error(f"Error loading trade history: {e}")
+        logging.error("Error loading trade history: {}".format(e))
         trade_history = []
 
 def save_trade(trade_data):
     global trade_history
-    logging.info(f"Saving trade: {trade_data}")
+    logging.info("Saving trade: {}".format(trade_data))
+    trade_history.append(trade_data)
+    try:
+        with open(TRADE_HISTORY_FILE, "w") as f:
+            json.dump(trade_history, f, indent=4)
+    except Exception as e:
+        logging.error("Error saving trade history: {}".format(e))
+
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return []
+    alpha = 2 / (period + 1)
+    ema = [prices[0]]
+    for price in prices[1:]:
+        ema_value = (price * alpha) + (ema[-1] * (1 - alpha))
+        ema.append(ema_value)
+    return ema
+
+def get_macd_signal():
+    global prev_histogram_value
+    max_retries = 3
+    logging.info("Calculating MACD signal for 1m timeframe...")
+    
+    for attempt in range(max_retries):
+        try:
+            # 1-хвилинний таймфрейм для скальпінгу
+            start_time = int((datetime.now() - timedelta(minutes=100)).timestamp() * 1000)
+            klines = client.get_klines(symbol=TRADE_SYMBOL, interval=Client.KLINE_INTERVAL_1MINUTE, limit=100, startTime=start_time)
+            close_prices = [float(k[4]) for k in klines]
+            
+            if len(close_prices) < max(MACD_SLOW, MACD_FAST, MACD_SIGNAL):
+                return {"signal": None, "details": "Недостатньо даних", "trend": "❌ Не визначено", "histogram": [], "klines": klines}
+
+            fast_ema = calculate_ema(close_prices, MACD_FAST)
+            slow_ema = calculate_ema(close_prices, MACD_SLOW)
+            
+            if not fast_ema or not slow_ema:
+                return {"signal": None, "details": "Помилка розрахунку EMA", "trend": "❌ Не визначено", "histogram": [], "klines": klines}
+
+            length = min(len(fast_ema), len(slow_ema))
+            macd = [fast_ema[i] - slow_ema[i] for i in range(length)]
+            
+            if not macd or len(macd) < MACD_SIGNAL:
+                return {"signal": None, "details": "MACD лінія занадто коротка", "trend": "❌ Не визначено", "histogram": [], "klines": klines}
+
+            signal = calculate_ema(macd, MACD_SIGNAL)
+            
+            if not signal:
+                return {"signal": None, "details": "Помилка розрахунку Signal line", "trend": "❌ Не визначено", "histogram": [], "klines": klines}
+
+            histogram_values = [macd[i] - signal[i] for i in range(min(len(macd), len(signal)))]
+            
+            if not histogram_values:
+                return {"signal": None, "details": "Помилка розрахунку Histogram", "trend": "❌ Не визначено", "histogram": [], "klines": klines}
+
+            current_hist = histogram_values[-1]
+            last_macd_value = macd[-1]
+            last_signal_value = signal[-1]
+            
+            # Визначаємо сигнали
+            if current_hist >= 0.0:
+                signal_action = "BUY"
+                trend = "🟢 Позитивний"
+            else:
+                signal_action = "SELL"
+                trend = "🔴 Негативний"
+                
+            return {"signal": signal_action, "details": "DIF {:.4f}, DEA {:.4f}".format(last_macd_value, last_signal_value), "trend": trend, "macd": macd, "signal_line": signal, "histogram": histogram_values, "klines": klines}
+
+        except Exception as e:
+            logging.error("Attempt {}/{} failed: {}".format(attempt + 1, max_retries, str(e)))
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                return {"signal": None, "details": "Помилка: {}".format(str(e)), "trend": "❌ Не визначено", "histogram": [], "klines": []}
+
+async def macd_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("MACD signal command triggered")
+    await update.message.reply_text("Обчислення MACD сигналу на 1хв таймфреймі...")
+    result = get_macd_signal()
+    
+    if not result or not result.get("histogram"):
+        await update.message.reply_text("Помилка: {}".format(result.get('details', 'Невдалося отримати MACD-сигнал')))
+        return
+
+    try:
+        current_price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
+        current_price = float(current_price_info['price']) if current_price_info else 'N/A'
+        hist_color_emoji = "🟢" if result["histogram"][-1] >= 0 else "🔴"
+        
+        response = [
+            "<b>{} @ {:.2f} (1m)</b>".format(TRADE_SYMBOL, current_price),
+            "<b>MACD (12,26,9): {} {:.4f}</b>".format(hist_color_emoji, result['histogram'][-1]),
+            "Тренд: {}".format(result['trend']),
+            "Сигнал: {}".format(result['signal']) if result['signal'] else "Сигналів для дії не виявлено"
+        ]
+        await update.message.reply_text("\\n".join(response), parse_mode='HTML')
+    except Exception as e:
+        logging.error("Error in macd_signal_command: {}".format(str(e)))
+        await update.message.reply_text("Помилка: {}".format(str(e)))
+
+async def get_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Getting balance...")
+    try:
+        balance_info = client.get_account()
+        btc_balance_info = next((asset for asset in balance_info['balances'] if asset['asset'] == "BTC"), None)
+        usdc_balance_info = next((asset for asset in balance_info['balances'] if asset['asset'] == "USDC"), None)
+        
+        btc_free = float(btc_balance_info['free']) if btc_balance_info else 0.0
+        usdc_free = float(usdc_balance_info['free']) if usdc_balance_info else 0.0
+        
+        await update.message.reply_text("💰 Баланс:\\nBTC: {:.8f}\\nUSDC: {:.2f}".format(btc_free, usdc_free))
+    except Exception as e:
+        logging.error("Error getting balance: {}".format(str(e)))
+        await update.message.reply_text("Помилка: {}".format(str(e)))
+
+async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Getting price...")
+    try:
+        price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
+        price = float(price_info['price'])
+        await update.message.reply_text("📈 Поточна ціна {}: {:.2f} USDC".format(TRADE_SYMBOL, price))
+    except Exception as e:
+        logging.error("Error getting price: {}".format(str(e)))
+        await update.message.reply_text("Помилка: {}".format(str(e)))
+
+async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Showing statistics...")
+    if not trade_history:
+        await update.message.reply_text("📊 Історія торгів порожня.")
+        return
+    
+    messages = ["<b>📊 Історія торгів:</b>"]
+    for trade in reversed(trade_history[-10:]):
+        trade_type = trade['type']
+        amount = trade['amount']
+        price = trade['price']
+        date = trade['date']
+        
+        trade_value = amount * price
+        messages.append("{} - {} {:.8f} BTC за {:.2f} USDC (Сума: {:.2f} USDC)".format(date, trade_type, amount, price, trade_value))
+    
+    await update.message.reply_text("\\n".join(messages), parse_mode='HTML')
+
+async def execute_market_trade(side: str):
+    max_retries = 3
+    logging.info("Executing {} trade...".format(side))
+
+    for attempt in range(max_retries):
+        try:
+            if side == "BUY":
+                balance_info = client.get_account()
+                usdc_balance_info = next((asset for asset in balance_info['balances'] if asset['asset'] == "USDC"), None)
+                usdc_balance = float(usdc_balance_info['free']) if usdc_balance_info else 0.0
+                
+                if usdc_balance < 10:  # Мінімум 10 USDC
+                    return "⚠️ Недостатньо USDC. Баланс: {:.2f} USDC".format(usdc_balance)
+                    
+                price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
+                current_price = float(price_info['price'])
+                quantity = usdc_balance / current_price
+                
+                # Купівля
+                order = client.create_order(
+                    symbol=TRADE_SYMBOL,
+                    side="BUY",
+                    type="MARKET",
+                    quantity="{:.8f}".format(quantity)
+                )
+                
+                filled_qty = sum(float(f['qty']) for f in order['fills'])
+                filled_price = sum(float(f['price']) * float(f['qty']) for f in order['fills']) / filled_qty if filled_qty > 0 else 0
+                
+                trade_data = {
+                    "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "type": "BUY",
+                    "amount": filled_qty,
+                    "price": filled_price
+                }
+                save_trade(trade_data)
+                
+                logging.info("Buy order executed: {}".format(trade_data))
+                return "🟢 Купівля: {:.8f} BTC за {:.2f} USDC".format(filled_qty, filled_price)
+
+            elif side == "SELL":
+                balance_info = client.get_account()
+                btc_balance_info = next((asset for asset in balance_info['balances'] if asset['asset'] == "BTC"), None)
+                btc_balance = float(btc_balance_info['free']) if btc_balance_info else 0.0
+                
+                if btc_balance < 0.0001:  # Мінімум 0.0001 BTC
+                    return "⚠️ Недостатньо BTC. Баланс: {:.8f} BTC".format(btc_balance)
+                    
+                order = client.create_order(
+                    symbol=TRADE_SYMBOL,
+                    side="SELL",
+                    type="MARKET",
+                    quantity="{:.8f}".format(btc_balance)
+                )
+                
+                filled_qty = sum(float(f['qty']) for f in order['fills'])
+                filled_price = sum(float(f['price']) * float(f['qty']) for f in order['fills']) / filled_qty if filled_qty > 0 else 0
+                
+                trade_data = {
+                    "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "type": "SELL",
+                    "amount": filled_qty,
+                    "price": filled_price
+                }
+                save_trade(trade_data)
+                
+                logging.info("Sell order executed: {}".format(trade_data))
+                return "🔴 Продаж: {:.8f} BTC за {:.2f} USDC".format(filled_qty, filled_price)
+
+        except Exception as e:
+            logging.error("Attempt {}/{} failed for trade: {}".format(attempt + 1, max_retries, str(e)))
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                return "Помилка торгівлі: {}".format(str(e))
+    
+    return "Помилка: не вдалося виконати угоду {}".format(side)
+
+async def buy_btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Buy BTC command triggered")
+    await update.message.reply_text("Спроба купівлі BTC...")
+    result = await asyncio.get_event_loop().run_in_executor(None, execute_market_trade, "BUY")
+    await update.message.reply_text(result)
+
+async def sell_btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Sell BTC command triggered")
+    await update.message.reply_text("Спроба продажу BTC...")
+    result = await asyncio.get_event_loop().run_in_executor(None, execute_market_trade, "SELL")
+    await update.message.reply_text(result)
+
+# ФУНКЦІЯ ДЛЯ АВТОТРЕЙДИНГУ (якої не було!)
+async def check_macd_and_trade(context: ContextTypes.DEFAULT_TYPE):
+    if not auto_trading_enabled:
+        return
+    
+    logging.info("🔄 Автоперевірка MACD сигналу...")
+    
+    try:
+        result = get_macd_signal()
+        
+        if not result or not result.get("histogram"):
+            logging.error("Не вдалося отримати MACD сигнал")
+            return
+        
+        signal_action = result["signal"]
+        
+        if signal_action == "BUY":
+            logging.info("📈 MACD сигнал: ПОКУПКА (гістограма ≥ 0)")
+            trade_message = await asyncio.get_event_loop().run_in_executor(None, execute_market_trade, "BUY")
+            
+            if trade_message:
+                current_price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
+                current_price = float(current_price_info['price']) if current_price_info else 'N/A'
+                
+                response = [
+                    "<b>🤖 АВТОТРЕЙДИНГ ({}):</b>".format(datetime.now().strftime('%H:%M:%S')),
+                    "<b>{} @ {:.2f}</b>".format(TRADE_SYMBOL, current_price),
+                    "<b>MACD: 🟢 {:.4f}</b>".format(result['histogram'][-1]),
+                    "Тренд: {}".format(result['trend']),
+                    "Дія: ПОКУПКА",
+                    "Результат: {}".format(trade_message)
+                ]
+                await context.bot.send_message(chat_id=context.job.chat_id, text="\\n".join(response), parse_mode='HTML')
+                
+        elif signal_action == "SELL":
+            logging.info("📉 MACD сигнал: ПРОДАЖ (гістограма < 0)")
+            trade_message = await asyncio.get_event_loop().run_in_executor(None, execute_market_trade, "SELL")
+            
+            if trade_message:
+                current_price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
+                current_price = float(current_price_info['price']) if current_price_info else 'N/A'
+                
+                response = [
+                    "<b>🤖 АВТОТРЕЙДИНГ ({}):</b>".format(datetime.now().strftime('%H:%M:%S')),
+                    "<b>{} @ {:.2f}</b>".format(TRADE_SYMBOL, current_price),
+                    "<b>MACD: 🔴 {:.4f}</b>".format(result['histogram'][-1]),
+                    "Тренд: {}".format(result['trend']),
+                    "Дія: ПРОДАЖ",
+                    "Результат: {}".format(trade_message)
+                ]
+                await context.bot.send_message(chat_id=context.job.chat_id, text="\\n".join(response), parse_mode='HTML')
+                
+        else:
+            logging.info("📊 MACD сигнал: НЕЙТРАЛЬНИЙ ({:.4f}) - жодних дій".format(result['histogram'][-1]))
+            
+    except Exception as e:
+        logging.error("Помилка в автотрейдингу: {}".format(str(e)))
+
+async def toggle_auto_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global auto_trading_enabled
+    job_queue = context.application.job_queue
+    
+    auto_trading_enabled = not auto_trading_enabled
+    
+    # Видалити всі старі завдання
+    for job in job_queue.get_jobs_by_name("auto_trading"):
+        job.schedule_removal()
+    
+    if auto_trading_enabled:
+        logging.info("✅ Автотрейдинг УВІМКНЕНО")
+        
+        # Додати нове завдання для перевірки кожні 60 секунд
+        job_queue.run_repeating(
+            check_macd_and_trade,
+            interval=AUTO_TRADE_INTERVAL,
+            first=10,  # Почати через 10 секунд
+            name="auto_trading",
+            chat_id=update.effective_chat.id
+        )
+        
+        await update.message.reply_text(
+            "✅ <b>АВТОТРЕЙДИНГ УВІМКНЕНО!</b>\\n\\n"
+            "⚡ Перевірка кожні {} секунд\\n"
+            "📊 MACD параметри: {}, {}, {}\\n"
+            "📈 Сигнал ПОКУПКИ: гістограма ≥ 0\\n"
+            "📉 Сигнал ПРОДАЖУ: гістограма < 0\\n\\n"
+            "Перша перевірка через 10 секунд...".format(AUTO_TRADE_INTERVAL, MACD_FAST, MACD_SLOW, MACD_SIGNAL),
+            parse_mode='HTML'
+        )
+    else:
+        logging.info("⛔ Автотрейдинг ВИМКНЕНО")
+        await update.message.reply_text("⛔ <b>АВТОТРЕЙДИНГ ВИМКНЕНО</b>", parse_mode='HTML')
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Starting bot...")
+    trade_keyboard = [
+        ["💰 Перевірити баланс", "📈 Ціна BTC"],
+        ["📊 MACD сигнал", "🤖 Автотрейдинг"],
+        ["🟢 Купити BTC", "🔴 Продати BTC"],
+        ["📊 Статистика торгів"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(trade_keyboard, resize_keyboard=True)
+    
+    status = "🟢 УВІМКНЕНО" if auto_trading_enabled else "🔴 ВИМКНЕНО"
+    
+    await update.message.reply_text(
+        "🔷 <b>Bitcoin Scalping Bot</b>\\n\\n"
+        "⚡ Таймфрейм: 1 хвилина\\n"
+        "📊 MACD: {}, {}, {}\\n"
+        "🤖 Автотрейдинг: {}\\n"
+        "⏱️ Перевірка: кожні {} сек\\n\\n"
+        "<b>Правила торгівлі:</b>\\n"
+        "• 🟢 Купівля: MACD гістограма ≥ 0\\n"
+        "• 🔴 Продаж: MACD гістограма < 0\\n\\n"
+        "<b>Оберіть дію:</b>".format(MACD_FAST, MACD_SLOW, MACD_SIGNAL, status, AUTO_TRADE_INTERVAL),
+        reply_markup=reply_markup,
+        parse_mode='HTML'
+    )
+
+async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Refreshing keyboard...")
+    trade_keyboard = [
+        ["💰 Перевірити баланс", "📈 Ціна BTC"],
+        ["📊 MACD сигнал", "🤖 Автотрейдинг"],
+        ["🟢 Купити BTC", "🔴 Продати BTC"],
+        ["📊 Статистика торгів"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(trade_keyboard, resize_keyboard=True)
+    
+    status = "🟢 УВІМКНЕНО" if auto_trading_enabled else "🔴 ВИМКНЕНО"
+    
+    await update.message.reply_text(
+        "✅ <b>Клавіатуру оновлено!</b>\\n"
+        "🤖 Автотрейдинг: {}\\n\\n"
+        "Оберіть дію:".format(status),
+        reply_markup=reply_markup,
+        parse_mode='HTML'
+    )
+
+def main():
+    logging.info("Starting main function...")
+    load_trade_history()
+    
+    # Створення Telegram Application
+    application = Application.builder().token(TELEGRAM_API_KEY).build()
+    
+    # Додавання обробників команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("refresh", refresh))
+    application.add_handler(MessageHandler(filters.Regex("^💰 Перевірити баланс$"), get_balance))
+    application.add_handler(MessageHandler(filters.Regex("^📈 Ціна BTC$"), get_price))
+    application.add_handler(MessageHandler(filters.Regex("^📊 MACD сигнал$"), macd_signal_command))
+    application.add_handler(MessageHandler(filters.Regex("^🤖 Автотрейдинг$"), toggle_auto_trading))
+    application.add_handler(MessageHandler(filters.Regex("^🟢 Купити BTC$"), buy_btc_command))
+    application.add_handler(MessageHandler(filters.Regex("^🔴 Продати BTC$"), sell_btc_command))
+    application.add_handler(MessageHandler(filters.Regex("^📊 Статистика торгів$"), show_statistics))
+    
+    logging.info("Application started for BTC scalping on 1m timeframe")
+    logging.info("Auto-trading interval: {} seconds".format(AUTO_TRADE_INTERVAL))
+    
+    # Запуск бота
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+if __name__ == '__main__':
+    main()    logging.info(f"Saving trade: {trade_data}")
     trade_history.append(trade_data)
     try:
         with open(TRADE_HISTORY_FILE, "w") as f:
