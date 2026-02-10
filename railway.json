@@ -6,7 +6,7 @@
   },
   "deploy": {
     "startCommand": "python main.py",
-    "healthcheckPath": null,  // ← Видаляємо healthcheck
+    "healthcheckPath": null,
     "restartPolicyType": "ON_FAILURE"
   }
 }
