@@ -9,8 +9,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 from binance.client import Client
 
-from decimal import Decimal, ROUND_DOWN
-
 # Логування
 logging.basicConfig(
     level=logging.INFO,
@@ -30,11 +28,10 @@ if not all([API_KEY, SECRET_KEY, TELEGRAM_TOKEN]):
 client = Client(API_KEY, SECRET_KEY)
 SYMBOL = "BTCUSDC"
 
-# Параметри MACD (1-хвилинний скальпінг)
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-AUTO_INTERVAL = 60  # 60 секунд
+AUTO_INTERVAL = 60  # 1 хвилина
 
 auto_trading_enabled = False
 trade_history = []
@@ -51,7 +48,7 @@ def load_trade_history():
             logging.error(f"Помилка завантаження історії: {e}")
             trade_history = []
     else:
-        logging.info("Файл історії не знайдено, починаємо з порожнього")
+        logging.info("Історія не знайдена, починаємо з порожньої")
     logging.info(f"Завантажено {len(trade_history)} угод")
 
 
@@ -61,7 +58,7 @@ def save_trade(trade_data):
     try:
         with open(HISTORY_FILE, "w") as f:
             json.dump(trade_history, f, indent=2)
-        logging.info(f"Збережено угоду: {trade_data}")
+        logging.info(f"Збережено: {trade_data}")
     except Exception as e:
         logging.error(f"Помилка збереження: {e}")
 
@@ -86,6 +83,7 @@ def get_macd_signal():
         closes = [float(k[4]) for k in klines]
 
         if len(closes) < MACD_SLOW:
+            logging.warning("Недостатньо свічок для MACD")
             return None
 
         fast = calculate_ema(closes, MACD_FAST)
@@ -166,20 +164,23 @@ def execute_trade(side):
 
             return f"🔴 Продано {filled:.8f} @ {avg:.2f}"
 
+    except BinanceAPIException as e:
+        logging.error(f"Binance API error ({side}): {e}")
+        return f"Помилка Binance: {e.message}"
     except Exception as e:
         logging.error(f"Trade failed ({side}): {e}")
         return f"Помилка: {str(e)}"
 
 
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info("Кнопка Купити натиснута")
+    logging.info("Кнопка Купити")
     await update.message.reply_text("Купівля...")
     result = await asyncio.to_thread(execute_trade, "BUY")
     await update.message.reply_text(result)
 
 
 async def sell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info("Кнопка Продати натиснута")
+    logging.info("Кнопка Продати")
     await update.message.reply_text("Продаж...")
     result = await asyncio.to_thread(execute_trade, "SELL")
     await update.message.reply_text(result)
@@ -189,12 +190,12 @@ async def check_and_trade(context: ContextTypes.DEFAULT_TYPE):
     logging.info("Запущено перевірку автотрейдингу")
     
     if not auto_trading_enabled:
-        logging.info("Автотрейдинг вимкнено, пропускаємо")
+        logging.info("Автотрейдинг вимкнено")
         return
 
     result = await asyncio.to_thread(get_macd_signal)
     if not result:
-        logging.warning("MACD сигнал не отримано")
+        logging.warning("MACD не отримано")
         return
 
     hist = result["histogram"]
@@ -238,7 +239,6 @@ async def toggle_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     job_queue = context.application.job_queue
 
-    # Видаляємо старі завдання
     for job in job_queue.get_jobs_by_name("auto"):
         job.schedule_removal()
         logging.info("Видалено старе завдання")
