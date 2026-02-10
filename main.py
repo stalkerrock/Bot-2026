@@ -4,7 +4,7 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
-import config
+
 from datetime import datetime, timedelta
 import json
 import os
