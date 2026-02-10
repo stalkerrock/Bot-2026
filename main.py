@@ -74,33 +74,22 @@ def get_macd_signal():
         hist = macd[-1] - sig[-1]
         return "BUY" if hist >= 0 else "SELL"
     except Exception as e:
-        logging.error("MACD failed: %s", e)
+        logging.error("MACD error: %s", e)
         return None
-
-
-async def safe_send(update_or_context, text):
-    """Безпечна відправка повідомлення без parse_mode"""
-    try:
-        if hasattr(update_or_context, 'message'):
-            await update_or_context.message.reply_text(text[:4000])
-        elif hasattr(update_or_context, 'bot'):
-            await update_or_context.bot.send_message(
-                chat_id=update_or_context.job.chat_id,
-                text=text[:4000]
-            )
-    except Exception as e:
-        logging.error("Cannot send message: %s", e)
 
 
 async def execute_trade(side):
     try:
-        if side == "BUY":
-            account = client.get_account()
-            usdc = float(next((b["free"] for b in account["balances"] if b["asset"] == "USDC"), 0))
-            if usdc < 10:
-                return "Недостатньо USDC"
+        account = client.get_account()
+        price = float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
 
-            price = float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
+        if side == "BUY":
+            usdc = float(next((b["free"] for b in account["balances"] if b["asset"] == "USDC"), 0))
+            logging.info(f"BUY attempt, USDC: {usdc:.2f}")
+
+            if usdc < 10:
+                return f"Недостатньо USDC (є {usdc:.2f})"
+
             qty = usdc / price
             qty_str = f"{qty:.8f}"
 
@@ -124,10 +113,11 @@ async def execute_trade(side):
             return f"🟢 Куплено {filled:.8f} BTC за ~{avg:.2f}"
 
         elif side == "SELL":
-            account = client.get_account()
             btc = float(next((b["free"] for b in account["balances"] if b["asset"] == "BTC"), 0))
+            logging.info(f"SELL attempt, BTC: {btc:.8f}")
+
             if btc < 0.0001:
-                return "Недостатньо BTC"
+                return f"Недостатньо BTC (є {btc:.8f})"
 
             qty_str = f"{btc:.8f}"
 
@@ -156,30 +146,23 @@ async def execute_trade(side):
 
 
 async def buy_btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send(update, "Купівля...")
+    logging.info("Кнопка 'Купити' натиснута")
+    await update.message.reply_text("Купівля...")
     result = await asyncio.to_thread(execute_trade, "BUY")
-    await safe_send(update, result)
+    await update.message.reply_text(result)
 
 
 async def sell_btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send(update, "Продаж...")
+    logging.info("Кнопка 'Продати' натиснута")
+    await update.message.reply_text("Продаж...")
     result = await asyncio.to_thread(execute_trade, "SELL")
-    await safe_send(update, result)
-
-
-async def check_and_trade(context: ContextTypes.DEFAULT_TYPE):
-    if not auto_trading_enabled:
-        return
-
-    signal = await asyncio.to_thread(get_macd_signal)
-    if signal:
-        result = await asyncio.to_thread(execute_trade, signal)
-        await safe_send(context, f"Авто: {signal} → {result}")
+    await update.message.reply_text(result)
 
 
 async def toggle_auto_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global auto_trading_enabled
     auto_trading_enabled = not auto_trading_enabled
+    logging.info(f"Автотрейдинг змінено на: {auto_trading_enabled}")
 
     job_queue = context.application.job_queue
     for job in job_queue.get_jobs_by_name("auto"):
@@ -189,59 +172,79 @@ async def toggle_auto_trading(update: Update, context: ContextTypes.DEFAULT_TYPE
         job_queue.run_repeating(
             check_and_trade,
             interval=AUTO_INTERVAL,
-            first=5,
+            first=10,
             name="auto",
             chat_id=update.effective_chat.id
         )
-        await safe_send(update, "Автотрейдинг увімкнено")
+        await update.message.reply_text("Автотрейдинг увімкнено")
     else:
-        await safe_send(update, "Автотрейдинг вимкнено")
+        await update.message.reply_text("Автотрейдинг вимкнено")
+
+
+async def check_and_trade(context: ContextTypes.DEFAULT_TYPE):
+    if not auto_trading_enabled:
+        return
+
+    logging.info("Перевірка автотрейдингу")
+    signal = await asyncio.to_thread(get_macd_signal)
+    if signal:
+        logging.info(f"Авто сигнал: {signal}")
+        result = await asyncio.to_thread(execute_trade, signal)
+        text = f"Автоугода: {signal} → {result}"
+        try:
+            await context.bot.send_message(chat_id=context.job.chat_id, text=text)
+        except Exception as e:
+            logging.error("Помилка відправки авто-повідомлення: %s", e)
 
 
 async def macd_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Кнопка MACD натиснута")
     signal = await asyncio.to_thread(get_macd_signal)
     if not signal:
-        await safe_send(update, "Не вдалося отримати сигнал MACD")
+        await update.message.reply_text("Не вдалося отримати сигнал")
         return
 
     price = float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
     emoji = "🟢" if signal == "BUY" else "🔴"
-
     text = f"{SYMBOL} @ {price:.2f}\nСигнал: {emoji} {signal}"
-    await safe_send(update, text)
+    await update.message.reply_text(text)
 
 
 async def get_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Кнопка Баланс натиснута")
     try:
         account = client.get_account()
         btc = float(next((b["free"] for b in account["balances"] if b["asset"] == "BTC"), 0))
         usdc = float(next((b["free"] for b in account["balances"] if b["asset"] == "USDC"), 0))
         text = f"Баланс:\nBTC: {btc:.8f}\nUSDC: {usdc:.2f}"
-        await safe_send(update, text)
+        await update.message.reply_text(text)
     except Exception as e:
-        await safe_send(update, f"Помилка: {str(e)}")
+        await update.message.reply_text(f"Помилка: {str(e)}")
 
 
 async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Кнопка Ціна натиснута")
     try:
         price = float(client.get_symbol_ticker(symbol=SYMBOL)["price"])
-        await safe_send(update, f"{SYMBOL}: {price:.2f}")
+        await update.message.reply_text(f"{SYMBOL}: {price:.2f}")
     except Exception as e:
-        await safe_send(update, f"Помилка: {str(e)}")
+        await update.message.reply_text(f"Помилка: {str(e)}")
 
 
 async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Кнопка Історія натиснута")
     if not trade_history:
-        await safe_send(update, "Історія порожня")
+        await update.message.reply_text("Історія порожня")
         return
 
     lines = ["Останні угоди:"]
     for t in trade_history[-10:]:
         lines.append(f"{t['date']} {t['type']} {t['amount']:.8f} @ {t['price']:.2f}")
-    await safe_send(update, "\n".join(lines))
+    await update.message.reply_text("\n".join(lines))
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Команда /start або кнопка старту")
     keyboard = [
         ["💰 Баланс", "📈 Ціна"],
         ["📊 MACD", "🤖 Авто"],
@@ -249,21 +252,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ["📊 Історія"]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await safe_send(update, "Вибери дію ↓", reply_markup=reply_markup)
+    await update.message.reply_text("Вибери дію ↓", reply_markup=reply_markup)
 
 
 def main():
     load_history()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Реєструємо обробники
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex("^(💰 Баланс)$"), get_balance))
-    app.add_handler(MessageHandler(filters.Regex("^(📈 Ціна)$"), get_price))
-    app.add_handler(MessageHandler(filters.Regex("^(📊 MACD)$"), macd_signal_command))
-    app.add_handler(MessageHandler(filters.Regex("^(🤖 Авто)$"), toggle_auto_trading))
-    app.add_handler(MessageHandler(filters.Regex("^(🟢 Купити)$"), buy_btc_command))
-    app.add_handler(MessageHandler(filters.Regex("^(🔴 Продати)$"), sell_btc_command))
-    app.add_handler(MessageHandler(filters.Regex("^(📊 Історія)$"), show_statistics))
+
+    # Ловимо по частині тексту — це найнадійніше
+    app.add_handler(MessageHandler(filters.Regex("Баланс"), get_balance))
+    app.add_handler(MessageHandler(filters.Regex("Ціна"), get_price))
+    app.add_handler(MessageHandler(filters.Regex("MACD"), macd_signal_command))
+    app.add_handler(MessageHandler(filters.Regex("Авто"), toggle_auto_trading))
+    app.add_handler(MessageHandler(filters.Regex("Купити"), buy_btc_command))
+    app.add_handler(MessageHandler(filters.Regex("Продати"), sell_btc_command))
+    app.add_handler(MessageHandler(filters.Regex("Історія"), show_statistics))
 
     logging.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
