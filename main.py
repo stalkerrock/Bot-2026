@@ -33,7 +33,7 @@ TRADE_SYMBOL = "BTCUSDC"
 MACD_FAST = 5
 MACD_SLOW = 10
 MACD_SIGNAL = 3
-AUTO_TRADE_INTERVAL = 60  # кожну хвилину
+AUTO_TRADE_INTERVAL = 60
 
 auto_trading_enabled = False
 trade_history = []
@@ -148,8 +148,12 @@ def execute_market_trade(side: str):
         account = client.get_account()
         price = float(client.get_symbol_ticker(symbol=TRADE_SYMBOL)['price'])
 
+        logging.info(f"Баланс перед {side}: {account['balances']}")
+
         if side == "BUY":
             usdc = float(next((a['free'] for a in account['balances'] if a['asset'] == 'USDC'), 0))
+            logging.info(f"USDC free: {usdc}")
+
             if usdc < 10:
                 return f"Недостатньо USDC: {usdc:.2f} (мін. ~10 USDC)"
 
@@ -177,8 +181,10 @@ def execute_market_trade(side: str):
 
         elif side == "SELL":
             btc = float(next((a['free'] for a in account['balances'] if a['asset'] == 'BTC'), 0))
+            logging.info(f"BTC free: {btc:.8f}, min_qty: {min_qty}")
+
             if btc < min_qty:
-                return f"Недостатньо BTC: {btc:.8f} (мін. {min_qty:.8f})"
+                return f"Недостатньо BTC для продажу\nДоступно: {btc:.8f} BTC\nМінімум: {min_qty:.8f} BTC"
 
             qty_str = f"{btc:.{qty_precision}f}"
 
@@ -204,7 +210,7 @@ def execute_market_trade(side: str):
     except BinanceAPIException as e:
         logging.error(f"Binance API error ({side}): {e.code} - {e.message}")
         if e.code == -1013:
-            return "Помилка: LOT_SIZE (занадто мала кількість)"
+            return "Помилка: LOT_SIZE (занадто мала кількість BTC)"
         if e.code == -2010:
             return "Помилка: Недостатньо коштів або інші обмеження"
         return f"Binance помилка: {e.message}"
