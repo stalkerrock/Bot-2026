@@ -1,32 +1,24 @@
 import asyncio
-import socket
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from binance.client import Client
-from binance.exceptions import BinanceAPIException, BinanceRequestException
-from datetime import datetime, timedelta
-import json
-import os
 import logging
+import os
+import json
+from datetime import datetime, timedelta
+
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
 from decimal import Decimal, ROUND_DOWN
 
 # Логування
-log_file = 'trading_bot.log'
-try:
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file, mode='a'),
-            logging.StreamHandler()
-        ]
-    )
-    logging.info("Logging initialized successfully")
-except Exception as e:
-    print(f"Failed to initialize logging: {e}")
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 
-# Ключі
 API_KEY = "3v2KzK8lhtYblymiQiRd9aFxuRZXOuv3wdgZnVgPGTWSIw7WQUYxxrPlf9cYQ8ul"
 SECRET_KEY = "aFXnMhVhhet45dBQyxVbJzVgJS5pSUsC8P7SvDvGS1Tn0WDkWMKQMD3PdZUOOitR"
 TELEGRAM_API_KEY = os.environ.get('TELEGRAM_API_KEY')
@@ -47,31 +39,28 @@ auto_trading_enabled = False
 trade_history = []
 TRADE_HISTORY_FILE = "trade_history.json"
 last_buy_price = None
-prev_histogram_value = None
 symbol_filters = {}
+
 
 def load_trade_history():
     global trade_history
-    logging.info("Loading trade history...")
     if os.path.exists(TRADE_HISTORY_FILE):
         try:
             with open(TRADE_HISTORY_FILE, "r") as f:
                 trade_history = json.load(f)
-        except json.JSONDecodeError as e:
-            logging.error(f"Error loading trade history: {e}. Starting with empty history.")
+        except Exception:
             trade_history = []
-    else:
-        logging.info("Trade history file not found. Starting with empty history.")
+    logging.info(f"Завантажено {len(trade_history)} угод")
 
-def save_trade(trade_data):
-    global trade_history
-    logging.info(f"Saving trade: {trade_data}")
-    trade_history.append(trade_data)
+
+def save_trade(data):
+    trade_history.append(data)
     try:
         with open(TRADE_HISTORY_FILE, "w") as f:
-            json.dump(trade_history, f, indent=4)
-    except IOError as e:
-        logging.error(f"Error saving trade history to file: {e}")
+            json.dump(trade_history, f, indent=2)
+    except Exception as e:
+        logging.error(f"Помилка збереження: {e}")
+
 
 def calculate_ema(prices, period):
     if len(prices) < period:
@@ -79,47 +68,72 @@ def calculate_ema(prices, period):
     alpha = 2 / (period + 1)
     ema = [prices[0]]
     for price in prices[1:]:
-        ema_value = (price * alpha) + (ema[-1] * (1 - alpha))
-        ema.append(ema_value)
+        ema.append(price * alpha + ema[-1] * (1 - alpha))
     return ema
 
+
 def get_macd_signal():
-    global prev_histogram_value
-    max_retries = 3
-    logging.info("Calculating MACD signal...")
-    for attempt in range(max_retries):
-        try:
-            start_time = int((datetime.now() - timedelta(minutes=100)).timestamp() * 1000)
-            klines = client.get_klines(symbol=TRADE_SYMBOL, interval=Client.KLINE_INTERVAL_1MINUTE, limit=100, startTime=start_time)
-            close_prices = [float(k[4]) for k in klines]
-            
-            if len(close_prices) < max(MACD_SLOW, MACD_FAST, MACD_SIGNAL):
-                return {"signal": None, "details": "Недостатньо даних", "trend": "❌ Не визначено", "histogram": []}
+    try:
+        klines = client.get_klines(
+            symbol=TRADE_SYMBOL,
+            interval=Client.KLINE_INTERVAL_1MINUTE,
+            limit=100
+        )
+        closes = [float(k[4]) for k in klines]
 
-            fast_ema = calculate_ema(close_prices, MACD_FAST)
-            slow_ema = calculate_ema(close_prices, MACD_SLOW)
-            
-            length = min(len(fast_ema), len(slow_ema))
-            macd = [fast_ema[i] - slow_ema[i] for i in range(length)]
-            
-            signal = calculate_ema(macd, MACD_SIGNAL)
-            histogram_values = [macd[i] - signal[i] for i in range(min(len(macd), len(signal)))]
-            
-            current_hist = histogram_values[-1]
-            
-            if prev_histogram_value is None:
-                prev_histogram_value = current_hist
-                return {"signal": None, "trend": "🟡 Чекаємо", "histogram": []}
-            
-            prev_histogram_value = current_hist
-            signal_action = "BUY" if current_hist >= 0 else "SELL"
-            trend = "🟢 Позитивний" if current_hist >= 0 else "🔴 Негативний"
-            return {"signal": signal_action, "trend": trend, "histogram": histogram_values}
+        if len(closes) < MACD_SLOW:
+            return None
 
-        except Exception as e:
-            logging.error(f"MACD attempt {attempt+1} failed: {e}")
-            if attempt == max_retries - 1:
-                return {"signal": None, "trend": "❌ Помилка", "histogram": []}
+        fast = calculate_ema(closes, MACD_FAST)
+        slow = calculate_ema(closes, MACD_SLOW)
+        macd = [f - s for f, s in zip(fast, slow)]
+        signal = calculate_ema(macd, MACD_SIGNAL)
+        hist = [m - s for m, s in zip(macd[-len(signal):], signal)]
+
+        current_hist = hist[-1]
+        action = "BUY" if current_hist >= 0 else "SELL"
+        trend = "🟢 Позитивний" if current_hist >= 0 else "🔴 Негативний"
+
+        return {"signal": action, "trend": trend, "histogram": current_hist}
+    except Exception as e:
+        logging.error(f"MACD failed: {e}")
+        return None
+
+
+def get_symbol_filters_info():
+    global symbol_filters
+    if TRADE_SYMBOL in symbol_filters:
+        return symbol_filters[TRADE_SYMBOL]
+
+    try:
+        exchange_info = client.get_exchange_info()
+        symbol_info = next(s for s in exchange_info['symbols'] if s['symbol'] == TRADE_SYMBOL)
+        
+        filters_dict = {f['filterType']: f for f in symbol_info['filters']}
+        
+        lot_size = filters_dict.get('LOT_SIZE') or filters_dict.get('MARKET_LOT_SIZE')
+        min_notional = filters_dict['NOTIONAL']
+        
+        current_filters = {
+            'minNotional': Decimal(min_notional['minNotional']),
+            'minQty': Decimal(lot_size['minQty']),
+            'maxQty': Decimal(lot_size['maxQty']),
+            'stepSize': Decimal(lot_size['stepSize']),
+        }
+        
+        step_size_str = str(current_filters['stepSize'])
+        if '.' in step_size_str:
+            current_filters['quantityPrecision'] = len(step_size_str.split('.')[1].rstrip('0'))
+        else:
+            current_filters['quantityPrecision'] = 0
+
+        symbol_filters[TRADE_SYMBOL] = current_filters
+        logging.info(f"Filters for {TRADE_SYMBOL}: {current_filters}")
+        return current_filters
+    except Exception as e:
+        logging.error(f"Failed to get filters: {e}")
+        raise
+
 
 def execute_market_trade(side: str):
     global last_buy_price
@@ -131,16 +145,16 @@ def execute_market_trade(side: str):
         step_size = filters_info['stepSize']
         qty_precision = filters_info['quantityPrecision']
 
-        balance_info = client.get_account()
+        account = client.get_account()
         price = float(client.get_symbol_ticker(symbol=TRADE_SYMBOL)['price'])
 
         if side == "BUY":
-            usdc = float(next((a['free'] for a in balance_info['balances'] if a['asset'] == 'USDC'), 0))
+            usdc = float(next((a['free'] for a in account['balances'] if a['asset'] == 'USDC'), 0))
             if usdc < 10:
                 return f"Недостатньо USDC: {usdc:.2f} (мін. ~10 USDC)"
 
             qty = usdc / price
-            qty_str = f"{qty:.8f}"
+            qty_str = f"{qty:.{qty_precision}f}"
 
             order = client.create_order(
                 symbol=TRADE_SYMBOL,
@@ -162,11 +176,11 @@ def execute_market_trade(side: str):
             return f"🟢 Куплено {filled:.8f} BTC @ {avg:.2f} USDC"
 
         elif side == "SELL":
-            btc = float(next((a['free'] for a in balance_info['balances'] if a['asset'] == 'BTC'), 0))
-            if btc < 0.0001:
-                return f"Недостатньо BTC: {btc:.8f} (мін. ~0.0001 BTC)"
+            btc = float(next((a['free'] for a in account['balances'] if a['asset'] == 'BTC'), 0))
+            if btc < min_qty:
+                return f"Недостатньо BTC: {btc:.8f} (мін. {min_qty:.8f})"
 
-            qty_str = f"{btc:.8f}"
+            qty_str = f"{btc:.{qty_precision}f}"
 
             order = client.create_order(
                 symbol=TRADE_SYMBOL,
@@ -198,30 +212,47 @@ def execute_market_trade(side: str):
         logging.error(f"Trade error ({side}): {e}")
         return f"Помилка: {str(e)}"
 
+
 async def buy_btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Купівля...")
     result = execute_market_trade("BUY")
     await update.message.reply_text(result)
+
 
 async def sell_btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Продаж...")
     result = execute_market_trade("SELL")
     await update.message.reply_text(result)
 
+
 async def check_macd_and_trade(context: ContextTypes.DEFAULT_TYPE):
     if not auto_trading_enabled:
         return
+
     result = get_macd_signal()
     if not result or not result.get("signal"):
         return
+
     trade_msg = execute_market_trade(result["signal"])
     price = float(client.get_symbol_ticker(symbol=TRADE_SYMBOL)["price"])
-    text = f"Авто {datetime.now().strftime('%H:%M:%S')}\nBTCUSDC @ {price:.2f}\nСигнал: {result['signal']}\nРезультат: {trade_msg}"
-    await context.bot.send_message(chat_id=context.job.data["chat_id"], text=text)
+
+    text = (
+        f"🤖 Авто {datetime.now().strftime('%H:%M:%S')}\n"
+        f"{TRADE_SYMBOL} @ {price:.2f}\n"
+        f"Сигнал: {result['signal']}\n"
+        f"Результат: {trade_msg}"
+    )
+
+    await context.bot.send_message(
+        chat_id=context.job.data["chat_id"],
+        text=text
+    )
+
 
 async def toggle_auto_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global auto_trading_enabled
     auto_trading_enabled = not auto_trading_enabled
+
     job_queue = context.application.job_queue
 
     for job in job_queue.get_jobs_by_name("auto"):
@@ -235,20 +266,24 @@ async def toggle_auto_trading(update: Update, context: ContextTypes.DEFAULT_TYPE
             name="auto",
             data={"chat_id": update.effective_chat.id}
         )
-        await update.message.reply_text("Автотрейдинг увімкнено (перевірка кожну хвилину)")
+        await update.message.reply_text("Автотрейдинг увімкнено (кожну хвилину)")
     else:
         await update.message.reply_text("Автотрейдинг вимкнено")
+
 
 async def macd_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = get_macd_signal()
     if not result or not result.get("histogram"):
         await update.message.reply_text("Не вдалося отримати MACD")
         return
+
     price = float(client.get_symbol_ticker(symbol=TRADE_SYMBOL)["price"])
-    hist = result["histogram"][-1]
+    hist = result["histogram"]
     emoji = "🟢" if hist >= 0 else "🔴"
+
     text = f"BTCUSDC @ {price:.2f}\nMACD: {emoji} {hist:.4f}\nТренд: {result['trend']}"
     await update.message.reply_text(text)
+
 
 async def get_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -259,12 +294,14 @@ async def get_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
 
+
 async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         price = float(client.get_symbol_ticker(symbol=TRADE_SYMBOL)["price"])
         await update.message.reply_text(f"BTCUSDC: {price:.2f}")
     except Exception as e:
         await update.message.reply_text(f"Помилка: {e}")
+
 
 async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not trade_history:
@@ -274,6 +311,7 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for t in trade_history[-10:]:
         lines.append(f"{t['date']} {t['type']} {t['amount']:.8f} @ {t['price']:.2f}")
     await update.message.reply_text("\n".join(lines))
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -287,8 +325,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
 
+
 def main():
     load_trade_history()
+
     application = Application.builder().token(TELEGRAM_API_KEY).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -302,6 +342,7 @@ def main():
 
     logging.info("Bot starting...")
     application.run_polling(drop_pending_updates=True)
+
 
 if __name__ == '__main__':
     main()
