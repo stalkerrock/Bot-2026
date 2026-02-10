@@ -10,6 +10,7 @@ import os
 import logging
 from decimal import Decimal, ROUND_DOWN
 
+# Логування
 log_file = 'trading_bot.log'
 try:
     logging.basicConfig(
@@ -25,6 +26,7 @@ except Exception as e:
     print(f"Failed to initialize logging: {e}")
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Ключі
 API_KEY = "3v2KzK8lhtYblymiQiRd9aFxuRZXOuv3wdgZnVgPGTWSIw7WQUYxxrPlf9cYQ8ul"
 SECRET_KEY = "aFXnMhVhhet45dBQyxVbJzVgJS5pSUsC8P7SvDvGS1Tn0WDkWMKQMD3PdZUOOitR"
 TELEGRAM_API_KEY = os.environ.get('TELEGRAM_API_KEY')
@@ -122,33 +124,78 @@ def get_macd_signal():
 def execute_market_trade(side: str):
     global last_buy_price
     try:
+        filters_info = get_symbol_filters_info()
+        min_notional = filters_info['minNotional']
+        min_qty = filters_info['minQty']
+        max_qty = filters_info['maxQty']
+        step_size = filters_info['stepSize']
+        qty_precision = filters_info['quantityPrecision']
+
         balance_info = client.get_account()
+        price = float(client.get_symbol_ticker(symbol=TRADE_SYMBOL)['price'])
+
         if side == "BUY":
             usdc = float(next((a['free'] for a in balance_info['balances'] if a['asset'] == 'USDC'), 0))
             if usdc < 10:
-                return f"Недостатньо USDC: {usdc:.2f}"
-            qty = usdc / float(client.get_symbol_ticker(symbol=TRADE_SYMBOL)['price'])
-            order = client.create_order(symbol=TRADE_SYMBOL, side=side, type="MARKET", quantity=f"{qty:.8f}")
+                return f"Недостатньо USDC: {usdc:.2f} (мін. ~10 USDC)"
+
+            qty = usdc / price
+            qty_str = f"{qty:.8f}"
+
+            order = client.create_order(
+                symbol=TRADE_SYMBOL,
+                side="BUY",
+                type="MARKET",
+                quantity=qty_str
+            )
+
             filled = sum(float(f['qty']) for f in order['fills'])
-            avg = sum(float(f['price']) * float(f['qty']) for f in order['fills']) / filled
+            avg = sum(float(f['price']) * float(f['qty']) for f in order['fills']) / filled if filled else 0
+
+            save_trade({
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "type": "BUY",
+                "amount": filled,
+                "price": avg
+            })
             last_buy_price = avg
-            save_trade({"date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "type": "BUY", "amount": filled, "price": avg})
-            return f"🟢 Куплено {filled:.8f} @ {avg:.2f}"
+            return f"🟢 Куплено {filled:.8f} BTC @ {avg:.2f} USDC"
 
         elif side == "SELL":
             btc = float(next((a['free'] for a in balance_info['balances'] if a['asset'] == 'BTC'), 0))
             if btc < 0.0001:
-                return f"Недостатньо BTC: {btc:.8f}"
-            order = client.create_order(symbol=TRADE_SYMBOL, side=side, type="MARKET", quantity=f"{btc:.8f}")
+                return f"Недостатньо BTC: {btc:.8f} (мін. ~0.0001 BTC)"
+
+            qty_str = f"{btc:.8f}"
+
+            order = client.create_order(
+                symbol=TRADE_SYMBOL,
+                side="SELL",
+                type="MARKET",
+                quantity=qty_str
+            )
+
             filled = sum(float(f['qty']) for f in order['fills'])
-            avg = sum(float(f['price']) * float(f['qty']) for f in order['fills']) / filled
-            save_trade({"date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "type": "SELL", "amount": filled, "price": avg})
+            avg = sum(float(f['price']) * float(f['qty']) for f in order['fills']) / filled if filled else 0
+
+            save_trade({
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "type": "SELL",
+                "amount": filled,
+                "price": avg
+            })
             last_buy_price = None
-            return f"🔴 Продано {filled:.8f} @ {avg:.2f}"
+            return f"🔴 Продано {filled:.8f} BTC @ {avg:.2f} USDC"
 
     except BinanceAPIException as e:
+        logging.error(f"Binance API error ({side}): {e.code} - {e.message}")
+        if e.code == -1013:
+            return "Помилка: LOT_SIZE (занадто мала кількість)"
+        if e.code == -2010:
+            return "Помилка: Недостатньо коштів або інші обмеження"
         return f"Binance помилка: {e.message}"
     except Exception as e:
+        logging.error(f"Trade error ({side}): {e}")
         return f"Помилка: {str(e)}"
 
 async def buy_btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -188,7 +235,7 @@ async def toggle_auto_trading(update: Update, context: ContextTypes.DEFAULT_TYPE
             name="auto",
             data={"chat_id": update.effective_chat.id}
         )
-        await update.message.reply_text("Автотрейдинг увімкнено")
+        await update.message.reply_text("Автотрейдинг увімкнено (перевірка кожну хвилину)")
     else:
         await update.message.reply_text("Автотрейдинг вимкнено")
 
