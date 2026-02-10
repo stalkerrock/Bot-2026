@@ -4,7 +4,6 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceRequestException
-
 from datetime import datetime, timedelta
 import json
 import os
@@ -434,7 +433,7 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for trade in reversed(trade_history[-10:]): 
         trade_amount_usdc = trade['amount'] * trade['price']
         profit_loss = 0
-        if 'last_buy_price' in globals() and last_buy_price is not None:
+        if last_buy_price is not None:
             if trade['type'] == 'SELL':
                 profit_loss = trade_amount_usdc - (trade['amount'] * last_buy_price)
             elif trade['type'] == 'BUY':
@@ -721,7 +720,7 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logging.info("Starting main function...")
     load_trade_history()
-    application = Application.builder().token(config.TELEGRAM_API_KEY).build()
+    application = Application.builder().token(TELEGRAM_API_KEY).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("refresh", refresh))
