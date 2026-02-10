@@ -1,5 +1,4 @@
-```txt
+txt
 python-telegram-bot==20.7
 python-binance==1.0.19
 requests==2.31.0
-```
