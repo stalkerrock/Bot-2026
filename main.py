@@ -381,7 +381,7 @@ async def check_macd_and_trade(context: ContextTypes.DEFAULT_TYPE):
         )
         
         await context.bot.send_message(
-            chat_id=context.job.chat_id,
+            chat_id=context.job.data["chat_id"],
             text=report,
             parse_mode='HTML'
         )
@@ -402,7 +402,7 @@ async def toggle_auto_trading(update: Update, context: ContextTypes.DEFAULT_TYPE
             interval=AUTO_TRADE_INTERVAL,
             first=10,
             name="auto_trading",
-            chat_id=update.effective_chat.id
+            data={"chat_id": update.effective_chat.id}
         )
         await update.message.reply_text(
             f"✅ <b>АВТОТРЕЙДИНГ УВІМКНЕНО!</b>\n\n"
