@@ -1,49 +1,47 @@
 import asyncio
-import logging
-import os
-import json
-import time
-from datetime import datetime, timedelta
-
+import socket
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from binance.client import Client
+from binance.exceptions import BinanceAPIException, BinanceRequestException
+import config
+from datetime import datetime, timedelta
+import json
+import os
+import logging
 from decimal import Decimal, ROUND_DOWN
 
-# Налаштування логування
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+log_file = 'trading_bot.log'
+try:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, mode='a'),
+            logging.StreamHandler()
+        ]
+    )
+    logging.info("Logging initialized successfully")
+except Exception as e:
+    print(f"Failed to initialize logging: {e}")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Отримання ключів з змінних середовища
-API_KEY = os.environ.get('API_KEY')
-SECRET_KEY = os.environ.get('SECRET_KEY')
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_API_KEY')
-
-if not all([API_KEY, SECRET_KEY, TELEGRAM_TOKEN]):
-    logging.error("Missing environment variables")
-    exit(1)
-
+API_KEY = "3v2KzK8lhtYblymiQiRd9aFxuRZXOuv3wdgZnVgPGTWSIw7WQUYxxrPlf9cYQ8ul"
+SECRET_KEY = "aFXnMhVhhet45dBQyxVbJzVgJS5pSUsC8P7SvDvGS1Tn0WDkWMKQMD3PdZUOOitR"
 client = Client(API_KEY, SECRET_KEY)
 TRADE_SYMBOL = "BTCUSDC"
 
-# Налаштування MACD для скальпінгу 1хв
-MACD_FAST = 12
-MACD_SLOW = 26  
-MACD_SIGNAL = 9
-AUTO_TRADE_INTERVAL = 60  # 60 секунд = 1 хвилина
+MACD_FAST = 5
+MACD_SLOW = 10
+MACD_SIGNAL = 3
+AUTO_TRADE_INTERVAL = 3600
 
 auto_trading_enabled = False
 trade_history = []
 TRADE_HISTORY_FILE = "trade_history.json"
 last_buy_price = None
+prev_histogram_value = None
 symbol_filters = {}
-
-
-# ========== ФУНКЦІЇ З ПРАЦЮЮЧОГО КОДУ ==========
 
 def load_trade_history():
     global trade_history
@@ -58,7 +56,6 @@ def load_trade_history():
     else:
         logging.info("Trade history file not found. Starting with empty history.")
 
-
 def save_trade(trade_data):
     global trade_history
     logging.info(f"Saving trade: {trade_data}")
@@ -66,9 +63,268 @@ def save_trade(trade_data):
     try:
         with open(TRADE_HISTORY_FILE, "w") as f:
             json.dump(trade_history, f, indent=4)
-    except Exception as e:
-        logging.error(f"Error saving trade history: {e}")
+    except IOError as e:
+        logging.error(f"Error saving trade history to file: {e}")
 
+def get_seconds_to_next_20_minute():
+    now = datetime.now()
+    current_hour = now.hour
+    current_minute = now.minute
+    current_second = now.second
+    current_microsecond = now.microsecond
+
+    if current_minute < 20:
+        minutes_to_wait = 20 - current_minute
+    elif 20 <= current_minute < 40:
+        minutes_to_wait = 40 - current_minute
+    else:  # current_minute >= 40
+        minutes_to_wait = 60 - current_minute + 20
+        current_hour += 1
+        if current_hour >= 24:
+            current_hour = 0
+
+    seconds_to_wait = (minutes_to_wait * 60) - current_second - (current_microsecond / 1000000)
+    if seconds_to_wait <= 0:
+        seconds_to_wait += 1200  # Додаємо 20 хвилин до наступного циклу
+
+    logging.info(f"Seconds to next 20th minute: {seconds_to_wait}")
+    return seconds_to_wait
+
+def generate_candlestick_graph(klines, max_bars=5):
+    if not klines:
+        return "Свічки: (немає даних)"
+    
+    candles = klines[-max_bars:]
+    if not candles:
+        return "Свічки: (немає даних для відображення)"
+
+    prices_flat = []
+    for k in candles:
+        prices_flat.extend([float(k[1]), float(k[2]), float(k[3]), float(k[4])])
+
+    max_price = max(prices_flat) if prices_flat else 1
+    min_price = min(prices_flat) if prices_flat else 0
+
+    price_range = max_price - min_price
+    if price_range == 0: 
+        price_range = max_price if max_price != 0 else 1 
+
+    graph = ["<b>Свічки (1h):</b>"]
+    for i, candle in enumerate(candles):
+        open_price = float(candle[1])
+        close_price = float(candle[4])
+        high_price = float(candle[2])
+        low_price = float(candle[3])
+        is_bullish = close_price >= open_price
+        color_emoji = "🟢" if is_bullish else "🔴"
+
+        candle_time = datetime.fromtimestamp(int(candle[0]) / 1000).strftime('%Y-%m-%d %H:%M')
+
+        BAR_SCALE = 10
+
+        normalized_open = (open_price - min_price) / price_range * BAR_SCALE
+        normalized_close = (close_price - min_price) / price_range * BAR_SCALE
+        normalized_high = (high_price - min_price) / price_range * BAR_SCALE
+        normalized_low = (low_price - min_price) / price_range * BAR_SCALE
+
+        body_start = min(normalized_open, normalized_close)
+        body_end = max(normalized_open, normalized_close)
+        
+        body_len = int(body_end - body_start)
+        lower_wick_len = int(body_start - normalized_low)
+        upper_wick_len = int(normalized_high - body_end)
+
+        if body_len < 1:
+            body_len = 1
+        
+        line_chars = [" "] * (BAR_SCALE + 2)
+
+        for j in range(int(normalized_low), int(normalized_high) + 1):
+            if 0 <= j < len(line_chars):
+                line_chars[j] = "│"
+        
+        for j in range(int(body_start), int(body_end) + 1):
+            if 0 <= j < len(line_chars):
+                line_chars[j] = "█"
+        
+        if open_price == close_price:
+            mid = int(normalized_open)
+            if 0 <= mid < len(line_chars):
+                line_chars[mid] = "─"
+
+        graph.append(f"{i+1}. {color_emoji} {close_price:.2f} ({candle_time}) {''.join(line_chars).strip()}")
+
+    return "\n".join(graph)
+
+def generate_histogram_graph(hist_values, klines, max_bars=10):
+    if not hist_values or not klines:
+        logging.warning("generate_histogram_graph: Empty histogram or klines data received")
+        return "Гістограма: (немає даних)"
+    
+    hist_values_slice = hist_values[-max_bars:] 
+    klines_slice = klines[-max_bars:]
+
+    all_values = [v for v in hist_values_slice if v is not None]
+    if not all_values:
+        return "Гістограма: (немає даних для відображення)"
+
+    max_abs_value = max(abs(v) for v in all_values) if all_values else 1 
+    if max_abs_value == 0:
+        max_abs_value = 1 
+
+    graph = ["<b>Гістограма MACD:</b>"]
+    BAR_WIDTH = 15
+
+    zero_line_pos = int(BAR_WIDTH / 2)
+    
+    for i in range(len(hist_values_slice)): 
+        hist_val = hist_values_slice[i]
+
+        hist_norm = hist_val / max_abs_value
+        
+        bar_length = int(abs(hist_norm) * zero_line_pos)
+
+        hist_bar_chars = [" "] * BAR_WIDTH
+        
+        if hist_val >= 0:
+            for j in range(zero_line_pos, zero_line_pos + bar_length):
+                if j < BAR_WIDTH:
+                    hist_bar_chars[j] = "█"
+            hist_color_emoji = "🟢"
+        else:
+            for j in range(zero_line_pos - bar_length, zero_line_pos):
+                if j >= 0:
+                    hist_bar_chars[j] = "█"
+            hist_color_emoji = "🔴"
+        
+        if 0 <= zero_line_pos < BAR_WIDTH:
+            hist_bar_chars[zero_line_pos] = "|"
+
+        candle_time = datetime.fromtimestamp(int(klines_slice[i][0]) / 1000).strftime('%Y-%m-%d %H:%M') if i < len(klines_slice) else "Немає даних"
+
+        graph.append(
+            f"{i+1}. {hist_color_emoji} {hist_val:.2f} ({candle_time}) | {''.join(hist_bar_chars)}"
+        )
+    
+    return "\n".join(graph)
+
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return []
+    alpha = 2 / (period + 1)
+    ema = [prices[0]]
+    for price in prices[1:]:
+        ema_value = (price * alpha) + (ema[-1] * (1 - alpha))
+        ema.append(ema_value)
+    return ema
+
+def get_macd_signal():
+    global prev_histogram_value
+    max_retries = 3
+    logging.info("Calculating MACD signal...")
+    for attempt in range(max_retries):
+        try:
+            start_time = int((datetime.now() - timedelta(minutes=100)).timestamp() * 1000)
+            klines = client.get_klines(symbol=TRADE_SYMBOL, interval=Client.KLINE_INTERVAL_1MINUTE, limit=100, startTime=start_time)
+            close_prices = [float(k[4]) for k in klines]
+            
+            logging.info(f"Close prices (last 10): {close_prices[-10:]}")
+            
+            if len(close_prices) < max(MACD_SLOW, MACD_FAST, MACD_SIGNAL):
+                logging.warning(f"Not enough klines to calculate MACD. Need at least {max(MACD_SLOW, MACD_FAST, MACD_SIGNAL)}, got {len(close_prices)}.")
+                return {"signal": None, "details": "Недостатньо даних для MACD", "trend": "❌ Не визначено", "macd": [], "signal_line": [], "histogram": [], "klines": klines}
+
+            fast_ema = calculate_ema(close_prices, MACD_FAST)
+            slow_ema = calculate_ema(close_prices, MACD_SLOW)
+            
+            logging.info(f"Fast EMA (last 5): {fast_ema[-5:]}")
+            logging.info(f"Slow EMA (last 5): {slow_ema[-5:]}")
+            
+            if not fast_ema or not slow_ema:
+                logging.warning("EMA calculation resulted in empty lists.")
+                return {"signal": None, "details": "Помилка розрахунку EMA", "trend": "❌ Не визначено", "macd": [], "signal_line": [], "histogram": [], "klines": klines}
+
+            if len(fast_ema) < MACD_SLOW or len(slow_ema) < MACD_SLOW:
+                logging.warning("Not enough EMA values for MACD calculation.")
+                return {"signal": None, "details": "Недостатньо EMA значень для MACD", "trend": "❌ Не визначено", "macd": [], "signal_line": [], "histogram": [], "klines": klines}
+
+            length = min(len(fast_ema), len(slow_ema))
+            macd = [fast_ema[i] - slow_ema[i] for i in range(length)]
+            
+            logging.info(f"MACD (last 5): {macd[-5:]}")
+            
+            if not macd or len(macd) < MACD_SIGNAL:
+                logging.warning("MACD line is too short to calculate Signal line.")
+                return {"signal": None, "details": "MACD лінія занадто коротка", "trend": "❌ Не визначено", "macd": macd, "signal_line": [], "histogram": [], "klines": klines}
+
+            signal = calculate_ema(macd, MACD_SIGNAL)
+            
+            logging.info(f"Signal (last 5): {signal[-5:]}")
+            
+            if not signal:
+                logging.warning("Signal line calculation resulted in an empty list.")
+                return {"signal": None, "details": "Помилка розрахунку Signal line", "trend": "❌ Не визначено", "macd": macd, "signal_line": signal, "histogram": [], "klines": klines}
+
+            histogram_values = [macd[i] - signal[i] for i in range(min(len(macd), len(signal)))]
+            
+            logging.info(f"Histogram (last 5): {histogram_values[-5:]}")
+            
+            if not histogram_values:
+                logging.warning("Histogram calculation resulted in an empty list.")
+                return {"signal": None, "details": "Помилка розрахунку Histogram", "trend": "❌ Не визначено", "macd": macd, "signal_line": signal, "histogram": [], "klines": klines}
+
+            current_hist = histogram_values[-1]
+            last_macd_value = macd[-1]
+            last_signal_value = signal[-1]
+            logging.info(f"MACD calculated: MACD={last_macd_value:.2f}, Signal={last_signal_value:.2f}, Histogram={current_hist:.2f}")
+
+            if prev_histogram_value is None:
+                prev_histogram_value = current_hist
+                return {"signal": None, "details": f"DIF {last_macd_value:.2f}, DEA {last_signal_value:.2f}", "trend": "🟡 Чекаємо перший стовпець", "macd": macd, "signal_line": signal, "histogram": histogram_values, "klines": klines}
+            
+            prev_histogram_value = current_hist
+            signal_action = "BUY" if current_hist >= 0 else "SELL" if current_hist < 0 else None
+            trend = "🟢 Позитивний" if current_hist >= 0 else "🔴 Негативний"
+            return {"signal": signal_action, "details": f"DIF {last_macd_value:.2f}, DEA {last_signal_value:.2f}", "trend": trend, "macd": macd, "signal_line": signal, "histogram": histogram_values, "klines": klines}
+
+        except Exception as e:
+            logging.error(f"Attempt {attempt + 1}/{max_retries} failed for MACD signal: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                return {"signal": None, "details": f"Помилка аналізу: {str(e)}", "trend": "❌ Не визначено", "macd": [], "signal_line": [], "histogram": [], "klines": []}
+
+async def macd_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("MACD signal command triggered")
+    await update.message.reply_text("Обчислення MACD сигналу, будь ласка зачекайте...")
+    result = get_macd_signal()
+    
+    if not result or not result.get("histogram"):
+        logging.error("get_macd_signal returned invalid data or histogram is empty")
+        await update.message.reply_text(f"Помилка: {result.get('details', 'Невдалося отримати MACD-сигнал або дані неповні.')}")
+        return
+
+    try:
+        candlestick_graph = generate_candlestick_graph(result["klines"])
+        hist_graph = generate_histogram_graph(result["histogram"], result["klines"])
+        hist_color_emoji = "🟢" if result["histogram"][-1] >= 0 else "🔴"
+        
+        current_price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
+        current_price = float(current_price_info['price']) if current_price_info else 'N/A'
+
+        response = [
+            f"<b>{TRADE_SYMBOL} @ {current_price:.4f} (1h)</b>",
+            f"<b>MACD: {hist_color_emoji} {result['histogram'][-1]:.2f}</b>",
+            f"\n{candlestick_graph}",
+            f"\n{hist_graph}",
+            f"\nТренд: {result['trend']}",
+            f"Останній сигнал: {result['signal']}" if result['signal'] else "Сигналів для дії не виявлено"
+        ]
+        logging.info("Sending MACD signal response to Telegram")
+        await update.message.reply_text("\n".join(response), parse_mode='HTML')
+    except Exception as e:
+        logging.error(f"Error in macd_signal_command: {str(e)}")
+        await update.message.reply_text(f"Помилка відображення MACD: {str(e)}")
 
 def get_symbol_filters_info():
     global symbol_filters
@@ -86,12 +342,15 @@ def get_symbol_filters_info():
                     break
             
             if not found_symbol_info:
-                raise ValueError(f"Symbol '{TRADE_SYMBOL}' not found.")
-            
+                logging.error(f"Symbol '{TRADE_SYMBOL}' not found in exchange info. Check available symbols in logs.")
+                raise ValueError(f"Symbol '{TRADE_SYMBOL}' not found in exchange info.")
+
             filters_dict = {f['filterType']: f for f in found_symbol_info['filters']}
             
+            logging.info(f"Raw filters for '{TRADE_SYMBOL}': {json.dumps(found_symbol_info['filters'], indent=2)}")
+
             if 'NOTIONAL' not in filters_dict: 
-                raise ValueError(f"Filter 'NOTIONAL' not found for {TRADE_SYMBOL}.")
+                raise ValueError(f"Filter 'NOTIONAL' (for minNotional) not found for {TRADE_SYMBOL}. Check your logs for available filter types.")
             
             lot_size_filter = None
             if 'LOT_SIZE' in filters_dict:
@@ -100,7 +359,7 @@ def get_symbol_filters_info():
                 lot_size_filter = filters_dict['MARKET_LOT_SIZE']
             
             if not lot_size_filter:
-                raise ValueError(f"LOT_SIZE filter not found for {TRADE_SYMBOL}.")
+                raise ValueError(f"Neither 'LOT_SIZE' nor 'MARKET_LOT_SIZE' filter found for {TRADE_SYMBOL}. Check your logs for available filter types.")
             
             min_notional_filter = filters_dict['NOTIONAL']
 
@@ -118,510 +377,364 @@ def get_symbol_filters_info():
                 current_filters['quantityPrecision'] = 0 
 
             symbol_filters[TRADE_SYMBOL] = current_filters
-            logging.info(f"Symbol filters for {TRADE_SYMBOL}: {symbol_filters[TRADE_SYMBOL]}")
+            logging.info(f"Successfully retrieved symbol filters for {TRADE_SYMBOL}: {symbol_filters[TRADE_SYMBOL]}")
             return symbol_filters[TRADE_SYMBOL]
-            
         except Exception as e:
-            logging.error(f"Attempt {attempt + 1} failed: {str(e)}")
+            logging.error(f"Attempt {attempt + 1}/{max_retries} failed to get symbol filters for {TRADE_SYMBOL}: {str(e)}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
             else:
-                raise RuntimeError(f"Failed to get symbol filters: '{str(e)}'")
+                raise RuntimeError(f"Failed to get symbol filters after {max_retries} attempts: '{str(e)}'")
 
-
-def calculate_ema(prices, period):
-    """Розрахунок EMA з працюючого коду"""
-    if len(prices) < period:
-        return []
-    alpha = 2 / (period + 1)
-    ema = [prices[0]]
-    for price in prices[1:]:
-        ema_value = (price * alpha) + (ema[-1] * (1 - alpha))
-        ema.append(ema_value)
-    return ema
-
-
-def get_macd_signal():
-    """MACD з працюючого коду, але адаптований для 1хв"""
+async def get_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Getting balance...")
     max_retries = 3
-    logging.info("Calculating MACD signal for 1m...")
-    
     for attempt in range(max_retries):
         try:
-            # ВИПРАВЛЕННЯ: Використовуємо 1-хвилинний інтервал
-            start_time = int((datetime.now() - timedelta(minutes=100)).timestamp() * 1000)
-            klines = client.get_klines(
-                symbol=TRADE_SYMBOL, 
-                interval=Client.KLINE_INTERVAL_1MINUTE,  # ЗМІНА ТУТ!
-                limit=100, 
-                startTime=start_time
-            )
+            balance_info = client.get_account()
+            btc_balance_info = next((asset for asset in balance_info['balances'] if asset['asset'] == "BTC"), None)
+            usdc_balance_info = next((asset for asset in balance_info['balances'] if asset['asset'] == "USDC"), None)
             
-            close_prices = [float(k[4]) for k in klines]
+            btc_free = float(btc_balance_info['free']) if btc_balance_info else 0.0
+            usdc_free = float(usdc_balance_info['free']) if usdc_balance_info else 0.0
             
-            if len(close_prices) < max(MACD_SLOW, MACD_FAST, MACD_SIGNAL):
-                return {"signal": None, "details": "Недостатньо даних", "trend": "❌"}
-            
-            fast_ema = calculate_ema(close_prices, MACD_FAST)
-            slow_ema = calculate_ema(close_prices, MACD_SLOW)
-            
-            if not fast_ema or not slow_ema:
-                return {"signal": None, "details": "Помилка EMA", "trend": "❌"}
-            
-            length = min(len(fast_ema), len(slow_ema))
-            macd = [fast_ema[i] - slow_ema[i] for i in range(length)]
-            
-            if not macd or len(macd) < MACD_SIGNAL:
-                return {"signal": None, "details": "MACD закоротка", "trend": "❌"}
-            
-            signal = calculate_ema(macd, MACD_SIGNAL)
-            
-            if not signal:
-                return {"signal": None, "details": "Помилка Signal", "trend": "❌"}
-            
-            histogram_values = [macd[i] - signal[i] for i in range(min(len(macd), len(signal)))]
-            
-            if not histogram_values:
-                return {"signal": None, "details": "Помилка Histogram", "trend": "❌"}
-            
-            current_hist = histogram_values[-1]
-            
-            # ПРОСТЕ ПРАВИЛО: гістограма ≥ 0 = BUY, < 0 = SELL
-            if current_hist >= 0:
-                signal_action = "BUY"
-                trend = "🟢 Позитивний"
-            else:
-                signal_action = "SELL"
-                trend = "🔴 Негативний"
-                
-            return {
-                "signal": signal_action, 
-                "trend": trend, 
-                "histogram": histogram_values, 
-                "klines": klines
-            }
-            
+            logging.info(f"Balance: BTC={btc_free:.8f}, USDC={usdc_free:.2f}")
+            await update.message.reply_text(f"💰 Баланс:\nBTC: {btc_free:.8f}\nUSDC: {usdc_free:.2f}")
+            return
         except Exception as e:
-            logging.error(f"Attempt {attempt + 1} failed: {str(e)}")
+            logging.error(f"Attempt {attempt + 1}/{max_retries} failed for balance: {str(e)}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
             else:
-                return {"signal": None, "details": f"Помилка: {str(e)}", "trend": "❌"}
-    
-    return {"signal": None, "details": "Всі спроби невдалі", "trend": "❌"}
+                await update.message.reply_text(f"Помилка отримання балансу: {str(e)}")
 
+async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Getting price...")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
+            price = float(price_info['price'])
+            logging.info(f"Price: {price:.2f} USDC")
+            await update.message.reply_text(f"📈 Поточна ціна {TRADE_SYMBOL}: {price:.2f} USDC")
+            return
+        except Exception as e:
+            logging.error(f"Attempt {attempt + 1}/{max_retries} failed for price: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                await update.message.reply_text(f"Помилка отримання ціни: {str(e)}")
+
+async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Showing statistics...")
+    if not trade_history:
+        await update.message.reply_text("📊 Історія торгів порожня.")
+        return
+    messages = ["📊 Історія торгів (останні 10):"]
+    for trade in reversed(trade_history[-10:]): 
+        trade_amount_usdc = trade['amount'] * trade['price']
+        profit_loss = 0
+        if 'last_buy_price' in globals() and last_buy_price is not None:
+            if trade['type'] == 'SELL':
+                profit_loss = trade_amount_usdc - (trade['amount'] * last_buy_price)
+            elif trade['type'] == 'BUY':
+                profit_loss = -(trade_amount_usdc - (trade['amount'] * last_buy_price))
+        profit_loss_color = f"<span style='color:green'>+{profit_loss:.2f} USDC</span>" if profit_loss >= 0 else f"<span style='color:red'>{profit_loss:.2f} USDC</span>"
+        messages.append(f"{trade['date']} - {trade['type']} {trade['amount']:.8f} BTC за {trade['price']:.2f} USDC (Зміна балансу: {profit_loss_color})") 
+    await update.message.reply_text("\n".join(messages), parse_mode='HTML')
+
+async def toggle_auto_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global auto_trading_enabled
+    logging.info("Toggling auto trading...")
+    job_queue = context.application.job_queue
+
+    auto_trading_enabled = not auto_trading_enabled
+
+    for job in job_queue.get_jobs_by_name("auto_trading"):
+        job.schedule_removal()
+
+    if auto_trading_enabled:
+        delay_to_first_execution = 10
+        
+        logging.info(f"Scheduling auto trading to start after {delay_to_first_execution} seconds with interval {AUTO_TRADE_INTERVAL} seconds")
+        job_queue.run_repeating(
+            check_macd_and_trade,
+            interval=AUTO_TRADE_INTERVAL,
+            first=delay_to_first_execution,
+            name="auto_trading",
+            data={"chat_id": update.effective_chat.id}
+        )
+        await update.message.reply_text(f"✅ Автотрейдинг увімкнено!\nПерша перевірка через 10 секунд. Наступні перевірки щогодини.")
+    else:
+        logging.info("Auto trading disabled")
+        await update.message.reply_text("⛔ Автотрейдинг вимкнено")
 
 def execute_market_trade(side: str):
-    """ТОРГІВЛЯ З ПРАЦЮЮЧОГО КОДУ - ОСНОВНА ФІКСАЦІЯ"""
     global last_buy_price
     max_retries = 3
     logging.info(f"Executing {side} trade...")
 
     try:
-        # ВИПРАВЛЕННЯ: Отримуємо фільтри
         filters_info = get_symbol_filters_info()
         min_notional = filters_info['minNotional']
         min_qty = filters_info['minQty']
         max_qty = filters_info['maxQty']
         step_size = filters_info['stepSize']
         qty_precision = filters_info['quantityPrecision']
+        logging.info(f"Filters retrieved: minNotional={min_notional}, minQty={min_qty}, maxQty={max_qty}, stepSize={step_size}, qtyPrecision={qty_precision}")
     except Exception as e:
-        logging.error(f"Failed to get filters: {e}")
-        return f"Помилка: Не вдалося отримати фільтри: {str(e)}"
+        logging.error(f"Failed to get symbol filters in execute_market_trade: {e}")
+        return f"Помилка торгівлі: Не вдалося отримати фільтри символу: {str(e)}"
 
     for attempt in range(max_retries):
         try:
             if side == "BUY":
-                # Купівля BTC за всі USDC
                 balance_info = client.get_account()
-                
-                # Шукаємо USDC баланс
-                usdc_balance_info = None
-                for asset in balance_info['balances']:
-                    if asset['asset'] == 'USDC':
-                        usdc_balance_info = asset
-                        break
-                
+                usdc_balance_info = next((asset for asset in balance_info['balances'] if asset['asset'] == "USDC"), None)
                 usdc_balance = Decimal(usdc_balance_info['free']) if usdc_balance_info else Decimal('0')
                 logging.info(f"USDC balance for BUY: {usdc_balance}")
 
-                # Поточна ціна
                 current_price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
                 current_price = Decimal(current_price_info['price'])
-                logging.info(f"Current price: {current_price}")
+                logging.info(f"Current price for BUY: {current_price}")
 
-                # Перевірка мінімального балансу
                 if usdc_balance < min_notional:
-                    return f"⚠️ Баланс {usdc_balance:.2f} USDC нижче мінімуму {min_notional:.2f} USDC"
+                    logging.warning(f"Balance {usdc_balance} is less than min_notional {min_notional} for BUY.")
+                    return f"Balance {usdc_balance:.2f} USDC is below minimum notional {min_notional:.2f} USDC for BUY."
 
-                # Купуємо на весь баланс
                 amount_to_spend = usdc_balance
 
-                # Розрахунок кількості BTC
+                if current_price <= 0:
+                    logging.error("Current price for BUY is zero or negative.")
+                    return "Помилка: Поточна ціна BTC є нульовою або від'ємною."
+
                 quantity_btc_raw = amount_to_spend / current_price
-                
-                # Округлення до stepSize
+
                 rounding_precision = Decimal('1E-%d' % qty_precision)
+
                 quantity_btc_decimal = (quantity_btc_raw / step_size).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_size
                 quantity_decimal = quantity_btc_decimal.quantize(rounding_precision, rounding=ROUND_DOWN)
 
-                # Перевірки
                 if quantity_btc_decimal < min_qty:
-                    return f"⚠️ Кількість {quantity_btc_decimal:.8f} BTC нижче мінімуму {min_qty}"
-                
+                    calculated_min_notional = min_qty * current_price
+                    if calculated_min_notional < min_notional:
+                        return f"⚠️ Розрахована кількість ({quantity_btc_decimal:.{qty_precision}f} BTC) замала навіть для мінімального ордеру ({min_qty:.{qty_precision}f} BTC * {current_price:.2f} = {calculated_min_notional:.2f} USDC), що менше {min_notional:.2f} USDC"
+                    return f"⚠️ Розрахована кількість {quantity_btc_decimal:.{qty_precision}f} BTC нижче мінімуму {min_qty}, і навіть мінімальний ордер ({min_qty:.{qty_precision}f} BTC * {current_price:.2f} = {calculated_min_notional:.2f} USDC) менший за {min_notional:.2f} USDC"
+                    quantity_btc_decimal = min_qty
+
                 if quantity_btc_decimal > max_qty:
-                    return f"⚠️ Кількість {quantity_btc_decimal:.8f} BTC перевищує максимум {max_qty}"
-                
+                    return f"⚠️ Розрахована кількість {quantity_btc_decimal:.4f} перевищує максимум {max_qty}"
+
                 calculated_notional = quantity_decimal * current_price
                 if calculated_notional < min_notional:
-                    return f"⚠️ Сума {calculated_notional:.2f} USDC нижче мінімуму {min_notional:.2f}"
+                    return f"⚠️ Розрахована вартість купівлі ({calculated_notional:.2f} USDC) нижче за мінімальний номінал ордеру ({min_notional:.2f} USDC)"
 
-                # ВИКОНАННЯ ОРДЕРУ
+                if quantity_decimal <= 0:
+                    return "⚠️ Розрахована кількість для купівлі є нульовою або від'ємною."
+
+                logging.info(f"Attempting to place BUY order for {TRADE_SYMBOL} with parameters: "
+                             f"quantity={quantity_decimal:.{qty_precision}f}, "
+                             f"minQty={min_qty}, maxQty={max_qty}, stepSize={step_size}, "
+                             f"qtyPrecision={qty_precision}, "
+                             f"minNotional={min_notional}, currentPrice={current_price}, "
+                             f"usdc_balance={usdc_balance}, "
+                             f"calculated_notional={calculated_notional}")
+
                 order = client.create_order(
                     symbol=TRADE_SYMBOL,
-                    side=Client.SIDE_BUY,
-                    type=Client.ORDER_TYPE_MARKET,
+                    side="BUY",
+                    type="MARKET",
                     quantity=f"{quantity_decimal:.{qty_precision}f}"
                 )
 
-                # Обробка результатів
-                filled_qty = sum(Decimal(f['qty']) for f in order['fills'])
-                filled_value = sum(Decimal(f['price']) * Decimal(f['qty']) for f in order['fills'])
-                filled_price = filled_value / filled_qty if filled_qty > 0 else Decimal('0')
+                filled_qty = sum(float(f['qty']) for f in order['fills'])
+                filled_price = sum(Decimal(f['price']) * Decimal(f['qty']) for f in order['fills']) / Decimal(str(filled_qty)) if filled_qty > 0 else Decimal('0')
 
-                # Збереження торгівлі
                 trade_data = {
-                    "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "date": datetime.now().strftime('%Y-%m-%d %H:%M'),
                     "type": "BUY",
                     "amount": float(filled_qty),
                     "price": float(filled_price)
                 }
-                last_buy_price = float(filled_price)
+                last_buy_price = trade_data["price"]
                 save_trade(trade_data)
-                
-                return f"🟢 Купівля: {filled_qty:.8f} BTC за {filled_price:.2f} USDC"
+                logging.info(f"Buy order executed: {trade_data}")
+                return f"🟢 Купівля: {trade_data['amount']:.6f} BTC за {trade_data['price']:.2f} USDC"
 
             elif side == "SELL":
-                # Продаж всього BTC
                 balance_info = client.get_account()
-                
-                # Шукаємо BTC баланс
-                btc_balance_info = None
-                for asset in balance_info['balances']:
-                    if asset['asset'] == 'BTC':
-                        btc_balance_info = asset
-                        break
-                
+                btc_balance_info = next((asset for asset in balance_info['balances'] if asset['asset'] == "BTC"), None)
                 btc_balance = Decimal(btc_balance_info['free']) if btc_balance_info else Decimal('0')
                 logging.info(f"BTC balance for SELL: {btc_balance}")
 
-                # Перевірка мінімальної кількості
                 if btc_balance < min_qty:
-                    return f"⚠️ Баланс {btc_balance:.8f} BTC нижче мінімуму {min_qty}"
+                    logging.warning(f"BTC balance {btc_balance} is less than minQty {min_qty} for SELL.")
+                    return f"⚠️ Недостатньо BTC для продажу. Мінімальна кількість: {min_qty:.6f}. У вас: {btc_balance:.6f}"
 
-                # Округлення
                 rounding_precision = Decimal('1E-%d' % qty_precision)
+
                 quantity_btc_decimal = (btc_balance / step_size).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_size
                 quantity_decimal = quantity_btc_decimal.quantize(rounding_precision, rounding=ROUND_DOWN)
 
-                # Перевірки
                 if quantity_btc_decimal > max_qty:
-                    return f"⚠️ Кількість {quantity_btc_decimal:.8f} BTC перевищує максимум {max_qty}"
+                    return f"⚠️ Розрахована кількість {quantity_btc_decimal:.2f} перевищує максимум {max_qty}"
 
-                # Поточна ціна для перевірки
+                if quantity_decimal <= 0:
+                    return "⚠️ Розрахована кількість для продажу є нульовою."
+
                 current_price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
                 current_price = Decimal(current_price_info['price'])
-                
+                logging.info(f"Current price for SELL: {current_price}")
+
                 calculated_notional = quantity_decimal * current_price
                 if calculated_notional < min_notional:
-                    return f"⚠️ Сума {calculated_notional:.2f} USDC нижче мінімуму {min_notional:.2f}"
+                    return f"⚠️ Розрахована вартість продажу ({calculated_notional:.2f} USDC) менша за мінімальний номінал ордеру ({min_notional:.2f} USDC)."
 
-                # ВИКОНАННЯ ОРДЕРУ
+                logging.info(f"Attempting to place SELL order for {TRADE_SYMBOL} with parameters: "
+                             f"quantity={quantity_decimal:.{qty_precision}f}, "
+                             f"minQty={min_qty}, maxQty={max_qty}, stepSize={step_size}, "
+                             f"qtyPrecision={qty_precision}, "
+                             f"minNotional={min_notional}, currentPrice={current_price}, "
+                             f"btcBalance={btc_balance}, "
+                             f"calculatedNotional={calculated_notional:.4f}")
+
                 order = client.create_order(
                     symbol=TRADE_SYMBOL,
-                    side=Client.SIDE_SELL,
-                    type=Client.ORDER_TYPE_MARKET,
+                    side="SELL",
+                    type="MARKET",
                     quantity=f"{quantity_decimal:.{qty_precision}f}"
                 )
 
-                # Обробка результатів
-                filled_qty = sum(Decimal(f['qty']) for f in order['fills'])
-                filled_value = sum(Decimal(f['price']) * Decimal(f['qty']) for f in order['fills'])
-                filled_price = filled_value / filled_qty if filled_qty > 0 else Decimal('0')
+                filled_qty = sum(float(f['qty']) for f in order['fills'])
+                filled_price = sum(Decimal(f['price']) * Decimal(f['qty']) for f in order['fills']) / Decimal(str(filled_qty)) if filled_qty > 0 else Decimal('0')
 
-                # Збереження торгівлі
                 trade_data = {
-                    "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "date": datetime.now().strftime('%Y-%m-%d %H:%M'),
                     "type": "SELL",
                     "amount": float(filled_qty),
                     "price": float(filled_price)
                 }
                 save_trade(trade_data)
                 last_buy_price = None
-                
-                return f"🔴 Продаж: {filled_qty:.8f} BTC за {filled_price:.2f} USDC"
+                logging.info(f"Sell order executed: {trade_data}")
+                return f"🔴 Продаж: {trade_data['amount']:.6f} BTC за {trade_data['price']:.2f} USDC"
 
         except Exception as e:
-            logging.error(f"Attempt {attempt + 1} failed: {str(e)}")
+            logging.error(f"Attempt {attempt + 1}/{max_retries} failed for trade: {str(e)}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
             else:
-                return f"❌ Помилка: {str(e)}"
-    
-    return f"❌ Не вдалося виконати угоду {side}"
-
-
-# ========== ТЕЛЕГРАМ КОМАНДИ ==========
+                return f"Помилка торгівлі: {str(e)}"
 
 async def buy_btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробник кнопки купівлі - ВИПРАВЛЕНА ВЕРСІЯ"""
-    logging.info("Buy BTC button pressed")
-    await update.message.reply_text("🔄 Спроба купівлі BTC...")
-    
-    # ВИПРАВЛЕННЯ: Викликаємо sync функцію через thread
-    result = await asyncio.to_thread(execute_market_trade, "BUY")
+    logging.info("Buy BTC command triggered")
+    await update.message.reply_text("Спроба купівлі BTC...")
+    result = execute_market_trade("BUY")
     await update.message.reply_text(result)
-
 
 async def sell_btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробник кнопки продажу - ВИПРАВЛЕНА ВЕРСІЯ"""
-    logging.info("Sell BTC button pressed")
-    await update.message.reply_text("🔄 Спроба продажу BTC...")
-    
-    # ВИПРАВЛЕННЯ: Викликаємо sync функцію через thread
-    result = await asyncio.to_thread(execute_market_trade, "SELL")
+    logging.info("Sell BTC command triggered")
+    await update.message.reply_text("Спроба продажу BTC...")
+    result = execute_market_trade("SELL")
     await update.message.reply_text(result)
 
-
 async def check_macd_and_trade(context: ContextTypes.DEFAULT_TYPE):
-    """АВТОТРЕЙДИНГ З ПРАЦЮЮЧОГО КОДУ"""
     if not auto_trading_enabled:
         return
-    
-    logging.info("🔄 Автоперевірка MACD...")
-    
-    # Отримуємо сигнал
-    result = await asyncio.to_thread(get_macd_signal)
+    logging.info("Checking MACD and trading...")
+    chat_id = context.job.data["chat_id"]
+    result = get_macd_signal()
     
     if not result or not result.get("histogram"):
-        logging.error("Не вдалося отримати MACD")
+        logging.error("check_macd_and_trade: get_macd_signal returned invalid data or histogram is empty")
+        await context.bot.send_message(chat_id=chat_id, text="Помилка: Невдалося отримати MACD-сигнал або дані неповні.")
         return
-    
+
     signal_action = result["signal"]
+    trade_message = None
+
+    histogram_value = result["histogram"][-1] if result["histogram"] else 0
     
-    if signal_action == "BUY":
-        logging.info("📈 MACD сигнал: ПОКУПКА")
-        trade_message = await asyncio.to_thread(execute_market_trade, "BUY")
-    elif signal_action == "SELL":
-        logging.info("📉 MACD сигнал: ПРОДАЖ")
-        trade_message = await asyncio.to_thread(execute_market_trade, "SELL")
+    if signal_action == "BUY" and histogram_value >= 0:
+        logging.info("MACD BUY signal detected (гістограма ≥ 0)!")
+        trade_message = execute_market_trade("BUY")
+    elif signal_action == "SELL" and histogram_value < 0:
+        logging.info("MACD SELL signal detected (гістограма < 0)!")
+        trade_message = execute_market_trade("SELL")
     else:
+        logging.info(f"Автотрейдинг: Сигнал не відповідає умовам. Signal: {signal_action}, Histogram: {histogram_value}")
         return
-    
+
     if trade_message:
-        # Отримуємо поточну ціну
-        price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
-        current_price = float(price_info['price']) if price_info else 0
-        
-        hist_color = "🟢" if result["histogram"][-1] >= 0 else "🔴"
-        
-        report = (
-            f"<b>🤖 АВТОТРЕЙДИНГ ({datetime.now().strftime('%H:%M:%S')})</b>\n"
-            f"📊 {TRADE_SYMBOL} @ {current_price:.2f}\n"
-            f"📈 MACD: {hist_color} {result['histogram'][-1]:.4f}\n"
-            f"📢 Сигнал: {signal_action}\n"
-            f"💼 Результат: {trade_message}"
-        )
-        
-        await context.bot.send_message(
-            chat_id=context.job.chat_id,
-            text=report,
-            parse_mode='HTML'
-        )
+        hist_color_emoji = "🟢" if histogram_value >= 0 else "🔴"
+        current_price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
+        current_price = float(current_price_info['price']) if current_price_info else 'N/A'
 
-
-async def toggle_auto_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Увімкнення автотрейдингу - ВИПРАВЛЕНА ВЕРСІЯ"""
-    global auto_trading_enabled
-    auto_trading_enabled = not auto_trading_enabled
-    
-    job_queue = context.application.job_queue
-    
-    # Видаляємо старі завдання
-    for job in job_queue.get_jobs_by_name("auto_trading"):
-        job.schedule_removal()
-    
-    if auto_trading_enabled:
-        # ВИПРАВЛЕННЯ: Правильний запуск завдання
-        job_queue.run_repeating(
-            check_macd_and_trade,
-            interval=AUTO_TRADE_INTERVAL,
-            first=10,  # Перша перевірка через 10 сек
-            name="auto_trading",
-            chat_id=update.effective_chat.id
-        )
-        
-        await update.message.reply_text(
-            f"✅ <b>АВТОТРЕЙДИНГ УВІМКНЕНО!</b>\n\n"
-            f"⚡ Перевірка кожні {AUTO_TRADE_INTERVAL} секунд\n"
-            f"📊 MACD: {MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}\n"
-            f"📈 Купівля: гістограма ≥ 0\n"
-            f"📉 Продаж: гістограма < 0\n\n"
-            f"Перша перевірка через 10 секунд...",
-            parse_mode='HTML'
-        )
-    else:
-        await update.message.reply_text("⛔ <b>АВТОТРЕЙДИНГ ВИМКНЕНО</b>", parse_mode='HTML')
-
-
-async def macd_signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ MACD сигналу"""
-    logging.info("MACD button pressed")
-    await update.message.reply_text("📊 Отримання MACD сигналу...")
-    
-    result = await asyncio.to_thread(get_macd_signal)
-    
-    if not result or not result.get("histogram"):
-        await update.message.reply_text("❌ Не вдалося отримати сигнал")
-        return
-    
-    # Поточна ціна
-    price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
-    current_price = float(price_info['price']) if price_info else 0
-    
-    hist_color = "🟢" if result["histogram"][-1] >= 0 else "🔴"
-    
-    message = (
-        f"<b>📊 MACD Сигнал (1хв)</b>\n\n"
-        f"🔹 Пара: {TRADE_SYMBOL}\n"
-        f"🔹 Ціна: {current_price:.2f} USDC\n"
-        f"🔹 MACD: {hist_color} {result['histogram'][-1]:.4f}\n"
-        f"🔹 Тренд: {result['trend']}\n"
-        f"🔹 Сигнал: <b>{result['signal'] or 'НЕЙТРАЛЬНО'}</b>\n"
-        f"🔹 Параметри: {MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}"
-    )
-    
-    await update.message.reply_text(message, parse_mode='HTML')
-
-
-async def get_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Баланс"""
-    try:
-        balance_info = client.get_account()
-        
-        btc_balance = 0.0
-        usdc_balance = 0.0
-        
-        for asset in balance_info['balances']:
-            if asset['asset'] == 'BTC':
-                btc_balance = float(asset['free'])
-            elif asset['asset'] == 'USDC':
-                usdc_balance = float(asset['free'])
-        
-        # Поточна ціна
-        price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
-        current_price = float(price_info['price'])
-        
-        btc_value = btc_balance * current_price
-        total_value = btc_value + usdc_balance
-        
-        message = (
-            f"<b>💰 Баланс</b>\n\n"
-            f"🔹 BTC: {btc_balance:.8f} (≈ {btc_value:.2f} USDC)\n"
-            f"🔹 USDC: {usdc_balance:.2f}\n"
-            f"🔹 Загалом: {total_value:.2f} USDC\n\n"
-            f"<i>Ціна BTC: {current_price:.2f} USDC</i>"
-        )
-        
-        await update.message.reply_text(message, parse_mode='HTML')
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ Помилка: {str(e)}")
-
-
-async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ціна"""
-    try:
-        price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
-        current_price = float(price_info['price'])
-        await update.message.reply_text(f"📈 {TRADE_SYMBOL}: {current_price:.2f} USDC")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Помилка: {str(e)}")
-
-
-async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статистика"""
-    if not trade_history:
-        await update.message.reply_text("📊 Історія торгів порожня")
-        return
-    
-    lines = ["<b>📊 Останні угоди:</b>"]
-    for trade in reversed(trade_history[-10:]):
-        emoji = "🟢" if trade['type'] == 'BUY' else "🔴"
-        value = trade['amount'] * trade['price']
-        lines.append(f"{emoji} {trade['date']} - {trade['type']} {trade['amount']:.8f} BTC @ {trade['price']:.2f} (≈{value:.2f} USDC)")
-    
-    await update.message.reply_text("\n".join(lines), parse_mode='HTML')
-
+        response_parts = [
+            f"<b>Автотрейдинг ({datetime.now().strftime('%H:%M:%S')}):</b>",
+            f"<b>{TRADE_SYMBOL} @ {current_price:.2f} USDC</b>",
+            f"<b>MACD гістограма (1хв): {hist_color_emoji} {histogram_value:.4f}</b>",
+            f"Тренд: {result['trend']}",
+            f"Сигнал: {signal_action}",
+            f"Результат торгівлі: {trade_message}"
+        ]
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(response_parts), parse_mode='HTML')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старт бота"""
-    keyboard = [
-        ["💰 Баланс", "📈 Ціна"],
-        ["📊 MACD", "🤖 Авто"],
-        ["🟢 Купити", "🔴 Продати"],
-        ["📊 Історія"]
+    logging.info("Starting bot...")
+    trade_keyboard = [
+        ["💰 Перевірити баланс", "📈 Ціна BTC"],
+        ["📊 MACD сигнал", "🤖 Автотрейдинг"],
+        ["🟢 Купити BTC", "🔴 Продати BTC"],
+        ["📊 Статистика"]
     ]
-    
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    auto_status = "🟢 УВІМКНЕНО" if auto_trading_enabled else "🔴 ВИМКНЕНО"
-    
-    message = (
-        f"<b>🤖 Bitcoin Scalping Bot</b>\n\n"
-        f"⚡ Таймфрейм: 1 хвилина\n"
-        f"📊 MACD: {MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}\n"
-        f"🤖 Автотрейдинг: {auto_status}\n"
-        f"⏱️ Перевірка: кожні {AUTO_TRADE_INTERVAL} сек\n\n"
-        f"<b>Оберіть дію:</b>"
+    reply_markup = ReplyKeyboardMarkup(trade_keyboard, resize_keyboard=True)
+    await update.message.reply_text(
+        "🔷 Торгівельний бот Binance\n\n"
+        "🤖 Автотрейдинг - автоматичні угоди за сигналами MACD (1хв)\n"
+        "📊 MACD сигнал - перевірка поточного стану\n"
+        "🟢 Купити BTC - купівля BTC за всю суму USDC за ринковою ціною\n"
+        "🔴 Продати BTC - продаж усього BTC за ринковою ціною\n"
+        "📊 Статистика - показує історію торгів\n\n"
+        "<b>Умови автотрейдингу:</b>\n"
+        "• Гістограма ≥ 0 → Купівля\n"
+        "• Гістограма < 0 → Продаж\n\n"
+        "Оберіть дію:\n(Якщо кнопки не оновилися, введіть /refresh для оновлення клавіатури)",
+        reply_markup=reply_markup,
+        parse_mode='HTML'
     )
-    
-    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
 
+async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Refreshing keyboard...")
+    trade_keyboard = [
+        ["💰 Перевірити баланс", "📈 Ціна BTC"],
+        ["📊 MACD сигнал", "🤖 Автотрейдинг"],
+        ["🟢 Купити BTC", "🔴 Продати BTC"],
+        ["📊 Статистика"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(trade_keyboard, resize_keyboard=True)
+    await update.message.reply_text(
+        "✅ Клавіатуру оновлено!\n\nОберіть дію:",
+        reply_markup=reply_markup
+    )
 
 def main():
-    """Запуск бота"""
+    logging.info("Starting main function...")
     load_trade_history()
-    
-    logging.info("Starting Bitcoin Scalping Bot...")
-    logging.info(f"Symbol: {TRADE_SYMBOL}")
-    logging.info(f"MACD: {MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}")
-    logging.info(f"Auto-trading interval: {AUTO_TRADE_INTERVAL}s")
-    
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Команди
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("refresh", start))
-    
-    # Кнопки - ВИПРАВЛЕНІ РЕГУЛЯРНІ ВИРАЗИ
-    app.add_handler(MessageHandler(filters.Regex(r'^💰 Баланс$'), get_balance))
-    app.add_handler(MessageHandler(filters.Regex(r'^📈 Ціна$'), get_price))
-    app.add_handler(MessageHandler(filters.Regex(r'^📊 MACD$'), macd_signal_command))
-    app.add_handler(MessageHandler(filters.Regex(r'^🤖 Авто$'), toggle_auto_trading))
-    app.add_handler(MessageHandler(filters.Regex(r'^🟢 Купити$'), buy_btc_command))
-    app.add_handler(MessageHandler(filters.Regex(r'^🔴 Продати$'), sell_btc_command))
-    app.add_handler(MessageHandler(filters.Regex(r'^📊 Історія$'), show_statistics))
-    
-    # Неправильні команди
-    async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("❌ Невідома команда. Натисніть /start")
-    
-    app.add_handler(MessageHandler(filters.ALL, unknown))
-    
-    logging.info("Bot is running...")
-    app.run_polling(drop_pending_updates=True)
+    application = Application.builder().token(config.TELEGRAM_API_KEY).build()
 
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("refresh", refresh))
+    application.add_handler(MessageHandler(filters.Regex("^(💰 Перевірити баланс)$"), get_balance))
+    application.add_handler(MessageHandler(filters.Regex("^(📈 Ціна BTC)$"), get_price))
+    application.add_handler(MessageHandler(filters.Regex("^(📊 MACD сигнал)$"), macd_signal_command))
+    application.add_handler(MessageHandler(filters.Regex("^(🤖 Автотрейдинг)$"), toggle_auto_trading))
+    application.add_handler(MessageHandler(filters.Regex("^(🟢 Купити BTC)$"), buy_btc_command))
+    application.add_handler(MessageHandler(filters.Regex("^(🔴 Продати BTC)$"), sell_btc_command))
+    application.add_handler(MessageHandler(filters.Regex("^(📊 Статистика)$"), show_statistics))
 
-if __name__ == "__main__":
+    logging.info("Application started")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
     main()
