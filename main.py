@@ -1,4 +1,4 @@
-```python
+python
 import asyncio
 import socket
 from telegram import Update, ReplyKeyboardMarkup
