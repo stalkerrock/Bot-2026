@@ -8,7 +8,6 @@ import config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Підключаємо ключі з нашого оновленого файлу config.py
 client = Client(config.BINANCE_API_KEY, config.BINANCE_SECRET_KEY)
 
 TRADE_SYMBOL = "SOLUSDC"              
@@ -125,7 +124,7 @@ async def check_supertrend_and_trade(context: ContextTypes.DEFAULT_TYPE):
     if not data: return
     if last_state is None:
         last_state = data["current_state"]
-        await context.bot.send_message(chat_id=chat_id, text=f"🤖 Бот активний! Поточний тренд Supertrend: <b>{last_state}</b>.", parse_mode="HTML")
+        await context.bot.send_message(chat_id=chat_id, text=f"🤖 Моніторинг активований! Поточний статус тренду: <b>{last_state}</b>.", parse_mode="HTML")
         return
     if data["action"] == "BUY":
         trade_msg = execute_spot_trade("BUY")
@@ -137,7 +136,12 @@ async def check_supertrend_and_trade(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=f"🚨 <b>СИГНАЛ SHORT (Париж: {data['candle_time']})</b>\n\n{trade_msg}", parse_mode="HTML")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trade_keyboard = [["💰 Перевірити баланс", "📈 Ціна SOL"], ["🤖 Автотрейдинг", "📊 Статистика логів"], ["🟢 Купити SOL (Маркет)", "🔴 Продати SOL (Маркет)"]]
+    trade_keyboard = [
+        ["💰 Перевірити баланс", "📈 Ціна SOL"],
+        ["🟢 Увімкнути автотрейдинг", "🔴 Вимкнути автотрейдинг"],
+        ["📊 Статистика логів"],
+        ["🟢 Ручна Купівля SOL", "🔴 Ручний Продаж SOL"]
+    ]
     await update.message.reply_text("🔷 Спотовий протокол SOL/USDC за індикатором Supertrend активований.", reply_markup=ReplyKeyboardMarkup(trade_keyboard, resize_keyboard=True))
 
 async def get_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,28 +173,48 @@ async def show_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{t['date']} | {'🟩' if t['type']=='BUY' else '🟥'} {t['type']} {t['amount']:.3f} SOL @ {t['price']:.2f}")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-async def toggle_trading_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def enable_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global auto_trading_enabled, last_state
-    job_queue = context.application.job_queue
-    auto_trading_enabled = not auto_trading_enabled
-    for job in job_queue.get_jobs_by_name("st_auto_job"): job.schedule_removal()
     if auto_trading_enabled:
-        last_state = None
-        job_queue.run_repeating(check_supertrend_and_trade, interval=AUTO_TRADE_INTERVAL, first=1, name="st_auto_job", data={"chat_id": update.effective_chat.id})
-        await update.message.reply_text("🚀 <b>Автотрейдинг за SuperTrend (5, 1.5) УВІМКНЕНО!</b>\nПара: SOL/USDC. Аналіз графіка.", parse_mode="HTML")
-    else: await update.message.reply_text("⛔ <b>Автотрейдинг ВИМКНЕНО.</b>", parse_mode="HTML")
+        await update.message.reply_text("⚠️ Автотрейдинг вже активний і працює.")
+        return
+    auto_trading_enabled = True
+    last_state = None
+    context.application.job_queue.run_repeating(
+        check_supertrend_and_trade, interval=AUTO_TRADE_INTERVAL, first=1, name="st_auto_job", data={"chat_id": update.effective_chat.id}
+    )
+    await update.message.reply_text("🚀 <b>Автотрейдинг за SuperTrend (5, 1.5) УВІМКНЕНО!</b>\nПара: SOL/USDC. Робот шукає точки входу.", parse_mode="HTML")
+
+async def disable_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global auto_trading_enabled
+    if not auto_trading_enabled:
+        await update.message.reply_text("⚠️ Автотрейдинг вже був вимкнений.")
+        return
+    auto_trading_enabled = False
+    for job in context.application.job_queue.get_jobs_by_name("st_auto_job"):
+        job.schedule_removal()
+    await update.message.reply_text("⛔ <b>Автотрейдинг ПОВНІСТЮ ВИМКНЕНО.</b> Ордери більше не виставляються.", parse_mode="HTML")
+
+async def trade_toggle_universal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global auto_trading_enabled
+    if auto_trading_enabled: await disable_trading(update, context)
+    else: await enable_trading(update, context)
 
 def main():
     load_trade_history()
-    # Підтягуємо токен з виправленої версії config.py
     application = Application.builder().token(config.TELEGRAM_API_KEY).build()
+    
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("trade", trade_toggle_universal))
+    
     application.add_handler(MessageHandler(filters.Regex("^(💰 Перевірити баланс)$"), get_balance_cmd))
     application.add_handler(MessageHandler(filters.Regex("^(📈 Ціна SOL)$"), get_price_cmd))
-    application.add_handler(MessageHandler(filters.Regex("^(🤖 Автотрейдинг)$"), toggle_trading_cmd))
+    application.add_handler(MessageHandler(filters.Regex(".*Увімкнути автотрейдинг.*"), enable_trading))
+    application.add_handler(MessageHandler(filters.Regex(".*Вимкнути автотрейдинг.*"), disable_trading))
     application.add_handler(MessageHandler(filters.Regex("^(📊 Статистика логів)$"), show_stats_cmd))
-    application.add_handler(MessageHandler(filters.Regex("^(🟢 Купити SOL \(Маркет\))$"), manual_buy_cmd))
-    application.add_handler(MessageHandler(filters.Regex("^(🔴 Продати SOL \(Маркет\))$"), manual_sell_cmd))
+    application.add_handler(MessageHandler(filters.Regex(".*Ручна Купівля SOL.*"), manual_buy_cmd))
+    application.add_handler(MessageHandler(filters.Regex(".*Ручний Продаж SOL.*"), manual_sell_cmd))
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__': main()
