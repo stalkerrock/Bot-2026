@@ -9,7 +9,6 @@ from decimal import Decimal, ROUND_DOWN
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from binance.client import Client
-import config  # Імпорт твого файлу конфігурації
 
 # Налаштування логування
 log_file = 'trading_bot.log'
@@ -19,14 +18,14 @@ logging.basicConfig(
     handlers=[logging.FileHandler(log_file, mode='a'), logging.StreamHandler()]
 )
 
-# 🔐 КЛЮЧІ API БІНАНС
+# 🔐 КЛЮЧІ API БІНАНС (Вшиті надійно, без зовнішніх імпортів)
 API_KEY = "3v2KzK8lhtYblymiQiRd9aFxuRZXOuv3wdgZnVgPGTWSIw7WQUYxxrPlf9cYQ8ul"
 SECRET_KEY = "aFXnMhVhhet45dBQyxVbJzVgJS5pSUsC8P7SvDvGS1Tn0WDkWMKQMD3PdZUOOitR"
 client = Client(API_KEY, SECRET_KEY)
 
 # ⚙️ ГЛОБАЛЬНІ НАЛАШТУВАННЯ ТОРГІВЛІ
 TRADE_SYMBOL = "SOLUSDC"              
-TEST_INTERVAL = Client.KLINE_INTERVAL_1MINUTE  # Сканування щохвилини
+TEST_INTERVAL = Client.KLINE_INTERVAL_1MINUTE  # Хвилинний таймфрейм для тесту
 SUPERTREND_PERIOD = 5                 
 SUPERTREND_MULTIPLIER = 1.5           
 AUTO_TRADE_INTERVAL = 10              
@@ -60,7 +59,7 @@ def save_trade(trade_data):
     except Exception as e:
         logging.error(f"Помилка запису історії: {e}")
 
-# --- 🧮 МАТЕМАТИКА SUPERTREND ВРУЧНУ (БЕЗ PANDAS) ---
+# --- 🧮 МАТЕМАТИКА SUPERTREND ВРУЧНУ (БЕЗ PANDAS / ТЕХНІЧНИХ БІБЛІОТЕК) ---
 def calculate_supertrend_manual(klines, period=5, multiplier=1.5):
     highs = [float(k[2]) for k in klines]
     lows = [float(k[3]) for k in klines]
@@ -177,12 +176,12 @@ def execute_spot_trade(side: str):
                 return f"❌ Бракує балансу USDC. На рахунку: {usdc_bal:.2f} USDC."
             raw_qty = usdc_bal / current_price
             qty = (raw_qty / filters_info['stepSize']).quantize(Decimal('1'), rounding=ROUND_DOWN) * filters_info['stepSize']
-            if qty * current_price < filters_info['minNotional']: return "⚠️ Сума замала."
+            if qty * current_price < filters_info['minNotional']: return "⚠️ Сума ордера замала для лімітів біржі."
             order = client.create_order(symbol=TRADE_SYMBOL, side="BUY", type="MARKET", quantity=f"{qty:.{filters_info['quantityPrecision']}f}")
         else:
             if sol_bal < filters_info['minQty']: return f"❌ Немає SOL на рахунку: {sol_bal:.4f} SOL"
             qty = (sol_bal / filters_info['stepSize']).quantize(Decimal('1'), rounding=ROUND_DOWN) * filters_info['stepSize']
-            if qty * current_price < filters_info['minNotional']: return "⚠️ Вартість замала."
+            if qty * current_price < filters_info['minNotional']: return "⚠️ Вартість SOL замала для продажу."
             order = client.create_order(symbol=TRADE_SYMBOL, side="SELL", type="MARKET", quantity=f"{qty:.{filters_info['quantityPrecision']}f}")
 
         filled_qty = sum(float(f['qty']) for f in order['fills'])
@@ -192,7 +191,7 @@ def execute_spot_trade(side: str):
         save_trade({"date": now_paris, "type": side, "amount": float(filled_qty), "price": float(filled_price)})
         return f"✅ Успішно: {side} {filled_qty:.4f} SOL по {filled_price:.2f} USDC"
     except Exception as e:
-        return f"❌ Помилка API: {e}"
+        return f"❌ Помилка API Бінанс: {e}"
 
 # --- 🔄 АВТОМАТИЧНИЙ ФОНОВИЙ ЦИКЛ (ЧИСТИЙ CONTEXT) ---
 async def check_macd_and_trade(context: ContextTypes.DEFAULT_TYPE):
@@ -271,7 +270,6 @@ async def toggle_trading_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
     if auto_trading_enabled:
         last_state = None
-        # Передаємо чисту функцію без зайвих обгорток lambda з update параметрами
         job_queue.run_repeating(
             check_macd_and_trade, 
             interval=AUTO_TRADE_INTERVAL, 
@@ -281,12 +279,16 @@ async def toggle_trading_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         await update.message.reply_text("🚀 <b>Автотрейдинг за SuperTrend УВІМКНЕНО!</b>\nАналіз закриття свічок відбувається щохвилини (Час: Париж).", parse_mode="HTML")
     else:
-        await update.message.reply_text("⛔ <b>Автотрейдинг ВИМКНЕНО.</b>", parse_mode="HTML")
+        await update.message.reply_text("⛔ <b>Автотрейдинг ВИМКНЕНО.</b> Робот перейшов у режим очікування.", parse_mode="HTML")
 
 # --- 🚀 ГОЛОВНИЙ ЗАПУСК ---
 def main():
     load_trade_history()
-    application = Application.builder().token("7795357191:AAFyesKdhD0VLpsC9-RAZRj0VS5DS7Tip-k").build()
+    
+    # ⚡ ТВІЙ ТОКЕН УСПІШНО ВШИТО СЮДИ:
+    TELEGRAM_TOKEN = "7795357191:AAFyesKdhD0VLpsC9-RAZRj0VS5DS7Tip-k"
+    
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Regex("^(💰 Перевірити баланс)$"), get_balance_cmd))
@@ -296,7 +298,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^(🟢 Купити SOL \(Маркет\))$"), manual_buy_cmd))
     application.add_handler(MessageHandler(filters.Regex("^(🔴 Продати SOL \(Маркет\))$"), manual_sell_cmd))
     
-    logging.info("Бот запущений і готовий до хвилинного тесту!")
+    logging.info("Бот успішно ініціалізований на сервері!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
