@@ -12,8 +12,8 @@ client = Client(config.BINANCE_API_KEY, config.BINANCE_SECRET_KEY)
 
 TRADE_SYMBOL = "SOLUSDC"              
 TEST_INTERVAL = Client.KLINE_INTERVAL_1MINUTE  
-SUPERTREND_PERIOD = 5                 
-SUPERTREND_MULTIPLIER = 1.5           
+SUPERTREND_PERIOD = 40                 
+SUPERTREND_MULTIPLIER = 6.5           
 AUTO_TRADE_INTERVAL = 10              
 PARIS_TZ = pytz.timezone("Europe/Paris")
 TRADE_HISTORY_FILE = "trade_history.json"
