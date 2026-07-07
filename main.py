@@ -3,6 +3,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext._jobqueue import AsyncioJobQueue  # Додано імпорт черги
 from binance.client import Client
 import config
 
@@ -202,16 +203,17 @@ async def trade_toggle_universal(update: Update, context: ContextTypes.DEFAULT_T
 
 def main():
     load_trade_history()
-    application = Application.builder().token(config.TELEGRAM_API_KEY).build()
+    # Виправлена ініціалізація додатку разом із JobQueue
+    application = Application.builder().token(config.TELEGRAM_API_KEY).job_queue(AsyncioJobQueue()).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("trade", trade_toggle_universal))
     
-    application.add_handler(MessageHandler(filters.Regex("^(💰 Перевірити баланс)$"), get_balance_cmd))
-    application.add_handler(MessageHandler(filters.Regex("^(📈 Ціна SOL)$"), get_price_cmd))
+    application.add_handler(MessageHandler(filters.Regex(".*Перевірити баланс.*"), get_balance_cmd))
+    application.add_handler(MessageHandler(filters.Regex(".*Ціна SOL.*"), get_price_cmd))
     application.add_handler(MessageHandler(filters.Regex(".*Увімкнути автотрейдинг.*"), enable_trading))
     application.add_handler(MessageHandler(filters.Regex(".*Вимкнути автотрейдинг.*"), disable_trading))
-    application.add_handler(MessageHandler(filters.Regex("^(📊 Статистика логів)$"), show_stats_cmd))
+    application.add_handler(MessageHandler(filters.Regex(".*Статистика логів.*"), show_stats_cmd))
     application.add_handler(MessageHandler(filters.Regex(".*Ручна Купівля SOL.*"), manual_buy_cmd))
     application.add_handler(MessageHandler(filters.Regex(".*Ручний Продаж SOL.*"), manual_sell_cmd))
     
