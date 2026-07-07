@@ -275,7 +275,7 @@ async def manual_sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -[span_93](start_span)-- 🚀 ЗАПУСК БОТА[span_93](end_span) ---
 def main():
     [span_94](start_span)load_trade_history()[span_94](end_span)
-    [span_95](start_span)application = Application.builder().token(config.TELEGRAM_API_KEY).build()[span_95](end_span)
+    [span_95](start_span)application = Application.builder().token(config.bot_token).build()[span_95](end_span)
     
     [span_96](start_span)application.add_handler(CommandHandler("start", start))[span_96](end_span)
     [span_97](start_span)application.add_handler(MessageHandler(filters.Regex("^(💰 Перевірити баланс)$"), get_balance_cmd))[span_97](end_span)
