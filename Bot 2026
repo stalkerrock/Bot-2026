@@ -201,10 +201,14 @@ def execute_spot_trade(side: str):
         return f"❌ Помилка: {e}"
 
 # --- 🔄 АВТОЦИКЛ ---
-async def check_macd_and_trade(context: ContextTypes.DEFAULT_TYPE):
-    global auto_trading_enabled, last_state
+async def check_macd_and_trade(update, context: ContextTypes.DEFAULT_TYPE = None):
+global auto_trading_enabled, last_state
     if not auto_trading_enabled: return
+    if hasattr(context, 'job') and context.job:
     chat_id = context.job.data["chat_id"]
+else:
+    chat_id = update.effective_chat.id
+
     data = get_supertrend_signal()
     if not data: return
     
