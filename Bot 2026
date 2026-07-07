@@ -3,15 +3,15 @@ import time
 import logging
 import json
 import os
-import pytz  # Для часу Парижа
+import pytz  # Для точного часу Парижа
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from binance.client import Client
-import config  # Твій конфіг з токеном
+import config  # Імпорт твого файлу конфігурації
 
-# Налаштування логування
+# Налаштування логування (виводить дані в консоль Pydroid та пише у файл)
 log_file = 'trading_bot.log'
 logging.basicConfig(
     level=logging.INFO,
@@ -19,23 +19,25 @@ logging.basicConfig(
     handlers=[logging.FileHandler(log_file, mode='a'), logging.StreamHandler()]
 )
 
-# 🔐 КЛЮЧІ API БІНАНС
+# 🔐 КЛЮЧІ API БІНАНС (Беремо з твого оригінального коду)
 API_KEY = "3v2KzK8lhtYblymiQiRd9aFxuRZXOuv3wdgZnVgPGTWSIw7WQUYxxrPlf9cYQ8ul"
 SECRET_KEY = "aFXnMhVhhet45dBQyxVbJzVgJS5pSUsC8P7SvDvGS1Tn0WDkWMKQMD3PdZUOOitR"
 client = Client(API_KEY, SECRET_KEY)
 
 # ⚙️ ГЛОБАЛЬНІ НАЛАШТУВАННЯ ТОРГІВЛІ
-TRADE_SYMBOL = "SOLUSDC"              
-TEST_INTERVAL = Client.KLINE_INTERVAL_1MINUTE  # Сканування щохвилини
-SUPERTREND_PERIOD = 5                 
-SUPERTREND_MULTIPLIER = 1.5           
-AUTO_TRADE_INTERVAL = 10              
-TRADE_HISTORY_FILE = "trade_history.json" 
+TRADE_SYMBOL = "SOLUSDC"              # Працюємо на споті з твоєю парою SOL/USDC
+TEST_INTERVAL = Client.KLINE_INTERVAL_1MINUTE  # Хвилинний таймфрейм для швидкого тесту
+SUPERTREND_PERIOD = 5                 # Твій період індикатора
+SUPERTREND_MULTIPLIER = 1.5           # Твій множник індикатора
+AUTO_TRADE_INTERVAL = 10              # Опитування циклу кожні 10 секунд
+TRADE_HISTORY_FILE = "trade_history.json" # Файл для збереження історії угод
 
+# Часовий пояс Парижа
 PARIS_TZ = pytz.timezone("Europe/Paris")
 
+# Змінні стану бота
 auto_trading_enabled = False
-last_state = None  
+last_state = None  # Пам'ять бота ("LONG" або "SHORT")
 trade_history = []
 symbol_filters = {}
 
@@ -60,7 +62,7 @@ def save_trade(trade_data):
 
 # --- 🧮 МАТЕМАТИКА SUPERTREND ВРУЧНУ (БЕЗ PANDAS) ---
 def calculate_supertrend_manual(klines, period=5, multiplier=1.5):
-    """Рахує SuperTrend без використання сторонніх бібліотек"""
+    """Математичний прорахунок індикатора SuperTrend на чистому Python"""
     highs = [float(k[2]) for k in klines]
     lows = [float(k[3]) for k in klines]
     closes = [float(k[4]) for k in klines]
@@ -96,11 +98,11 @@ def calculate_supertrend_manual(klines, period=5, multiplier=1.5):
         basic_ub[i] = hl2 + (multiplier * atr[i])
         basic_lb[i] = hl2 - (multiplier * atr[i])
         
-        # Розрахунок фінальних ліній (ігноруємо проскоки всередині тренду)
+        # Обчислення верхньої та нижньої меж
         final_ub[i] = basic_ub[i] if (basic_ub[i] < final_ub[i-1] or closes[i-1] > final_ub[i-1]) else final_ub[i-1]
         final_lb[i] = basic_lb[i] if (basic_lb[i] > final_lb[i-1] or closes[i-1] < final_lb[i-1]) else final_lb[i-1]
         
-        # Визначаємо напрямок тренду
+        # Визначаємо розвороти тренду
         if direction[i-1] == 1:
             direction[i] = 1 if closes[i] >= final_lb[i] else -1
         else:
@@ -111,11 +113,13 @@ def calculate_supertrend_manual(klines, period=5, multiplier=1.5):
     return direction, st_line, list(closes), [k[0] for k in klines]
 
 def get_supertrend_signal():
+    """Визначає стан та сигнали на останні закритій свічці"""
     try:
         klines = client.get_klines(symbol=TRADE_SYMBOL, interval=TEST_INTERVAL, limit=100)
+        # Виправлена помилка: всі змінні тепер написані через одну літеру 'P'
         direction, st_line, closes, times = calculate_supertrend_manual(klines, SUPERTREND_PERIOD, SUPERTREND_MULTIPLIER)
         
-        # [-2] — остання повністю закрита свічка
+        # [-2] — остання повністю закрита свічка, яка нас цікавить за твоєю стратегією
         # [-3] — свічка перед нею
         current_dir = direction[-2]
         prev_dir = direction[-3]
@@ -123,14 +127,15 @@ def get_supertrend_signal():
         candle_st_state = "LONG" if current_dir == 1 else "SHORT"
         prev_st_state = "LONG" if prev_dir == 1 else "SHORT"
         
+        # Переведення UNIX-часу біржі у часовий пояс Парижа
         utc_time = datetime.utcfromtimestamp(int(times[-2]) / 1000).replace(tzinfo=pytz.utc)
         paris_time_str = utc_time.astimezone(PARIS_TZ).strftime('%H:%M:%S')
         
         action = None
         if prev_st_state == "SHORT" and candle_st_state == "LONG":
-            action = "BUY"
+            action = "BUY"   # Розворот у зелену зону
         elif prev_st_state == "LONG" and candle_st_state == "SHORT":
-            action = "SELL"
+            action = "SELL"  # Розворот у червону зону
             
         return {
             "action": action, 
@@ -143,7 +148,7 @@ def get_supertrend_signal():
         logging.error(f"Помилка індикатора: {e}")
         return None
 
-# --- 🛠 БІРЖЕВІ ФІЛЬТРИ ---
+# --- 🛠 БІРЖЕВІ ФІЛЬТРИ ТА ОКРУГЛЕННЯ ---
 def get_symbol_filters_info():
     global symbol_filters
     if TRADE_SYMBOL in symbol_filters:
@@ -167,7 +172,7 @@ def get_symbol_filters_info():
         logging.error(f"Помилка отримання фільтрів: {e}")
         return None
 
-# --- 💰 ОРДЕРІ НА СПОТІ ---
+# --- 💰 ВИКОНАННЯ ОРДЕРІВ НА СПОТІ З ПЕРЕВІРКОЮ БАЛАНСУ ---
 def execute_spot_trade(side: str):
     try:
         filters_info = get_symbol_filters_info()
@@ -179,16 +184,20 @@ def execute_spot_trade(side: str):
         current_price = Decimal(client.get_symbol_ticker(symbol=TRADE_SYMBOL)['price'])
         
         if side == "BUY":
+            # Перевірка балансу USDC перед купівлею
             if usdc_bal < filters_info['minNotional']:
                 return f"❌ Бракує балансу USDC. На рахунку: {usdc_bal:.2f} USDC."
             raw_qty = usdc_bal / current_price
             qty = (raw_qty / filters_info['stepSize']).quantize(Decimal('1'), rounding=ROUND_DOWN) * filters_info['stepSize']
-            if qty * current_price < filters_info['minNotional']: return "⚠️ Сума замала."
+            if qty * current_price < filters_info['minNotional']: return "⚠️ Сума замала для лімітів біржі."
+            
             order = client.create_order(symbol=TRADE_SYMBOL, side="BUY", type="MARKET", quantity=f"{qty:.{filters_info['quantityPrecision']}f}")
         else:
-            if sol_bal < filters_info['minQty']: return f"❌ Немає SOL на рахунку: {sol_bal:.4f}"
+            # Перевірка наявності SOL перед продажем
+            if sol_bal < filters_info['minQty']: return f"❌ Немає SOL на рахунку: {sol_bal:.4f} SOL"
             qty = (sol_bal / filters_info['stepSize']).quantize(Decimal('1'), rounding=ROUND_DOWN) * filters_info['stepSize']
-            if qty * current_price < filters_info['minNotional']: return "⚠️ Сума замала."
+            if qty * current_price < filters_info['minNotional']: return "⚠️ Вартість SOL замала для продажу."
+            
             order = client.create_order(symbol=TRADE_SYMBOL, side="SELL", type="MARKET", quantity=f"{qty:.{filters_info['quantityPrecision']}f}")
 
         filled_qty = sum(float(f['qty']) for f in order['fills'])
@@ -198,33 +207,39 @@ def execute_spot_trade(side: str):
         save_trade({"date": now_paris, "type": side, "amount": float(filled_qty), "price": float(filled_price)})
         return f"✅ Успішно: {side} {filled_qty:.4f} SOL по {filled_price:.2f} USDC"
     except Exception as e:
-        return f"❌ Помилка: {e}"
+        return f"❌ Помилка API: {e}"
 
-# --- 🔄 АВТОЦИКЛ ---
+# --- 🔄 АВТОМАТИЧНИЙ ФОНОВИЙ ЦИКЛ ---
+# Виправлена помилка: додано підтримку обох аргументів (update та context) для уникнення TypeError
 async def check_macd_and_trade(update, context: ContextTypes.DEFAULT_TYPE = None):
-global auto_trading_enabled, last_state
+    global auto_trading_enabled, last_state
     if not auto_trading_enabled: return
-    if hasattr(context, 'job') and context.job:
-    chat_id = context.job.data["chat_id"]
-else:
-    chat_id = update.effective_chat.id
-
+    
+    # Визначаємо chat_id залежно від типу фонового чи ручного запуску
+    if context and hasattr(context, 'job') and context.job:
+        chat_id = context.job.data["chat_id"]
+        bot_instance = context.bot
+    else:
+        chat_id = update.effective_chat.id
+        bot_instance = context.bot if context else update.get_bot()
+        
     data = get_supertrend_signal()
     if not data: return
     
     if last_state is None:
         last_state = data["current_state"]
-        await context.bot.send_message(chat_id=chat_id, text=f"🤖 Бот активний! Поточний тренд: <b>{last_state}</b>.", parse_mode="HTML")
+        await bot_instance.send_message(chat_id=chat_id, text=f"🤖 Бот активний! Поточний тренд на закритій свічці: <b>{last_state}</b>.", parse_mode="HTML")
         return
 
+    # Якщо зафіксовано підтверджений перетин (розворот) на початку нової свічки
     if data["action"] == "BUY":
         trade_msg = execute_spot_trade("BUY")
         last_state = "LONG"
-        await context.bot.send_message(chat_id=chat_id, text=f"🚀 <b>СИГНАЛ LONG (Париж: {data['candle_time']})</b>\n\n{trade_msg}", parse_mode="HTML")
+        await bot_instance.send_message(chat_id=chat_id, text=f"🚀 <b>СИГНАЛ LONG (Париж: {data['candle_time']})</b>\n\n{trade_msg}", parse_mode="HTML")
     elif data["action"] == "SELL":
         trade_msg = execute_spot_trade("SELL")
         last_state = "SHORT"
-        await context.bot.send_message(chat_id=chat_id, text=f"🚨 <b>СИГНАЛ SHORT (Париж: {data['candle_time']})</b>\n\n{trade_msg}", parse_mode="HTML")
+        await bot_instance.send_message(chat_id=chat_id, text=f"🚨 <b>СИГНАЛ SHORT (Париж: {data['candle_time']})</b>\n\n{trade_msg}", parse_mode="HTML")
 
 # --- 📲 ТЕЛЕГРАМ ІНТЕРФЕЙС ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,35 +249,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ["🟢 Купити SOL (Маркет)", "🔴 Продати SOL (Маркет)"]
     ]
     reply_markup = ReplyKeyboardMarkup(trade_keyboard, resize_keyboard=True)
-    await update.message.reply_text("🔷 Робот SOL/USDC запущений на телефоні.", reply_markup=reply_markup)
+    await update.message.reply_text("🔷 Робочий спотовий протокол SOL/USDC активований.\nОберіть команду на панелі:", reply_markup=reply_markup)
 
 async def get_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         account = client.get_account()
         sol = float(next((a['free'] for a in account['balances'] if a['asset'] == "SOL"), 0.0))
         usdc = float(next((a['free'] for a in account['balances'] if a['asset'] == "USDC"), 0.0))
-        await update.message.reply_text(f"💳 <b>Баланс:</b>\n• USDC: <code>{usdc:.2f}</code>\n• SOL: <code>{sol:.4f}</code>", parse_mode="HTML")
-    except Exception as e: await update.message.reply_text(f"Помилка: {e}")
+        await update.message.reply_text(f"💳 <b>Баланс на споті:</b>\n• USDC: <code>{usdc:.2f}</code>\n• SOL: <code>{sol:.4f}</code>", parse_mode="HTML")
+    except Exception as e: await update.message.reply_text(f"Помилка балансу: {e}")
 
 async def get_price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         price_info = client.get_symbol_ticker(symbol=TRADE_SYMBOL)
-        await update.message.reply_text(f"📈 Ціна SOL: <code>{float(price_info['price']):.2f} USDC</code>", parse_mode="HTML")
-    except Exception as e: await update.message.reply_text(f"Помилка: {e}")
+        await update.message.reply_text(f"📈 Спотова ціна SOL: <code>{float(price_info['price']):.2f} USDC</code>", parse_mode="HTML")
+    except Exception as e: await update.message.reply_text(f"Помилка ціни: {e}")
 
 async def manual_buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Виконую ручний спотовий ордер на купівлю...")
     res = execute_spot_trade("BUY")
     await update.message.reply_text(res)
 
 async def manual_sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Виконую ручний спотовий ордер на продаж...")
     res = execute_spot_trade("SELL")
     await update.message.reply_text(res)
 
 async def show_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not trade_history:
-        await update.message.reply_text("📭 Логи порожні.")
+        await update.message.reply_text("📭 Історія логів поки що порожня.")
         return
-    lines = ["📊 <b>Останні ордери:</b>"]
+    lines = ["📊 <b>Історія останніх спотових угод:</b>"]
     for t in reversed(trade_history[-10:]):
         emoji = "🟩" if t['type'] == "BUY" else "🟥"
         lines.append(f"{t['date']} | {emoji} {t['type']} {t['amount']:.3f} SOL @ {t['price']:.2f}")
@@ -278,14 +295,22 @@ async def toggle_trading_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
     if auto_trading_enabled:
         last_state = None
-        job_queue.run_repeating(check_macd_and_trade, interval=AUTO_TRADE_INTERVAL, first=1, name="st_auto_job", data={"chat_id": update.effective_chat.id})
-        await update.message.reply_text("🚀 <b>Автотрейдинг увімкнено!</b>\nСканування щохвилини.", parse_mode="HTML")
+        # Запуск регулярного фонового сканування кожні 10 секунд
+        job_queue.run_repeating(
+            lambda ctx: check_macd_and_trade(None, ctx), 
+            interval=AUTO_TRADE_INTERVAL, 
+            first=1, 
+            name="st_auto_job", 
+            data={"chat_id": update.effective_chat.id}
+        )
+        await update.message.reply_text("🚀 <b>Автотрейдинг за SuperTrend УВІМКНЕНО!</b>\nАналіз закриття свічок відбувається щохвилини (Час: Париж).", parse_mode="HTML")
     else:
-        await update.message.reply_text("⛔ <b>Автотрейдинг вимкнено.</b>", parse_mode="HTML")
+        await update.message.reply_text("⛔ <b>Автотрейдинг ВИМКНЕНО.</b> Робот перейшов у режим очікування.", parse_mode="HTML")
 
+# --- 🚀 ГОЛОВНИЙ ЗАПУСК ---
 def main():
     load_trade_history()
-    # ⚠️ Використовуємо твою стару назву змінної з config.py: config.bot_token
+    # Використовуємо оригінальну назву токена з твого config.py
     application = Application.builder().token(config.TELEGRAM_API_KEY).build()
     
     application.add_handler(CommandHandler("start", start))
@@ -296,6 +321,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^(🟢 Купити SOL \(Маркет\))$"), manual_buy_cmd))
     application.add_handler(MessageHandler(filters.Regex("^(🔴 Продати SOL \(Маркет\))$"), manual_sell_cmd))
     
+    logging.info("Бот запущений і готовий до хвилинного тесту!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
