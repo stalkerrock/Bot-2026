@@ -113,7 +113,7 @@ def calculate_supertrend_manual(klines, period=5, multiplier=1.5):
 def get_supertrend_signal():
     try:
         klines = client.get_klines(symbol=TRADE_SYMBOL, interval=TEST_INTERVAL, limit=100)
-        direction, st_line, closes, times = calculate_supertrend_manual(klines, SUPPERTREND_PERIOD, SUPERTREND_MULTIPLIER)
+        direction, st_line, closes, times = calculate_supertrend_manual(klines, SUPERTREND_PERIOD, SUPERTREND_MULTIPLIER)
         
         # [-2] — остання повністю закрита свічка
         # [-3] — свічка перед нею
