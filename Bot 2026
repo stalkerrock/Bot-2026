@@ -5,6 +5,7 @@ import json
 import os
 import pandas as pd
 import pandas_ta as ta
+import config
 import pytz  # Для чіткої прив'язки до часового поясу Парижа
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
