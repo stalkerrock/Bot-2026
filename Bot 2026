@@ -282,7 +282,7 @@ async def toggle_trading_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def main():
     load_trade_history()
     # ⚠️ Використовуємо твою стару назву змінної з config.py: config.bot_token
-    application = Application.builder().token(config.bot_token).build()
+    application = Application.builder().token(config.TELEGRAM_API_KEY).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Regex("^(💰 Перевірити баланс)$"), get_balance_cmd))
