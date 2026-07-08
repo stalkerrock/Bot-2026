@@ -12,10 +12,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 client = Client(config.BINANCE_API_KEY, config.BINANCE_SECRET_KEY)
 
 TRADE_SYMBOL = "SOLUSDC"              
-TEST_INTERVAL = Client.KLINE_INTERVAL_1MINUTE  # Щоховелинні свічки
+TEST_INTERVAL = Client.KLINE_INTERVAL_1HOUR   # Змінено на 1-годинні свічки
 SUPERTREND_PERIOD = 20                 # Період 20
 SUPERTREND_MULTIPLIER = 5.0           # Множник 5.0
-AUTO_TRADE_INTERVAL = 10              # Перевірка ринку кожні 10 секунд
+AUTO_TRADE_INTERVAL = 60              # Перевірка ринку кожні 60 секунд (1 хвилина)
 PARIS_TZ = pytz.timezone("Europe/Paris")
 TRADE_HISTORY_FILE = "trade_history.json"
 
@@ -184,7 +184,7 @@ async def enable_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auto_trading_enabled:
         auto_trading_enabled = True
         context.job_queue.run_repeating(auto_job, interval=AUTO_TRADE_INTERVAL, first=1, name="st_auto_job", data={"chat_id": update.effective_chat.id})
-        await update.message.reply_text("🚀 <b>Автотрейдинг за SuperTrend (20, 5.0) УВІМКНЕНО!</b>\nБот сканує щохвилинні закриті свічки.", parse_mode="HTML")
+        await update.message.reply_text("🚀 <b>Автотрейдинг за SuperTrend (20, 5.0) УВІМКНЕНО!</b>\nБот сканує закриті 1-годинні свічки.", parse_mode="HTML")
     else:
         await update.message.reply_text("⚠️ Автотрейдинг уже запущений.")
 
