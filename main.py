@@ -6,15 +6,16 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from binance.client import Client
 import config
 
+# Налаштування логування для відстеження роботи у Railway
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 client = Client(config.BINANCE_API_KEY, config.BINANCE_SECRET_KEY)
 
 TRADE_SYMBOL = "SOLUSDC"              
-TEST_INTERVAL = Client.KLINE_INTERVAL_1MINUTE  
-SUPERTREND_PERIOD = 2                 
-SUPERTREND_MULTIPLIER = 5         
-AUTO_TRADE_INTERVAL = 10              
+TEST_INTERVAL = Client.KLINE_INTERVAL_1MINUTE  # Щоховелинні свічки
+SUPERTREND_PERIOD = 20                 # Період 20
+SUPERTREND_MULTIPLIER = 5.0           # Множник 5.0
+AUTO_TRADE_INTERVAL = 10              # Перевірка ринку кожні 10 секунд
 PARIS_TZ = pytz.timezone("Europe/Paris")
 TRADE_HISTORY_FILE = "trade_history.json"
 
@@ -30,17 +31,29 @@ def load_trade_history():
         except: trade_history = []
 
 def save_trade(side, price, qty):
+    try:
+        acc = client.get_account()
+        usdc_bal = float(next((a['free'] for a in acc['balances'] if a['asset'] == "USDC"), 0))
+        sol_bal = float(next((a['free'] for a in acc['balances'] if a['asset'] == "SOL"), 0))
+        total_usdc_value = usdc_bal + (sol_bal * float(price))
+    except:
+        total_usdc_value = 0.0
+
     trade = {
         "time": datetime.now(PARIS_TZ).strftime('%Y-%m-%d %H:%M:%S'),
         "side": side,
         "price": float(price),
-        "qty": float(qty)
+        "qty": float(qty),
+        "total_usdc_value": float(total_usdc_value)
     }
     trade_history.append(trade)
-    with open(TRADE_HISTORY_FILE, "w") as f:
-        json.dump(trade_history, f, indent=4)
+    try:
+        with open(TRADE_HISTORY_FILE, "w") as f:
+            json.dump(trade_history, f, indent=4)
+    except Exception as e:
+        logging.error(f"Не вдалося зберегти історію: {e}")
 
-def calculate_supertrend_manual(klines, period=5, multiplier=1.5):
+def calculate_supertrend_manual(klines, period=20, multiplier=5.0):
     highs, lows, closes = [float(k[2]) for k in klines], [float(k[3]) for k in klines], [float(k[4]) for k in klines]
     tr = []
     for i in range(len(closes)):
@@ -68,28 +81,23 @@ def get_supertrend_signal():
         klines = client.get_klines(symbol=TRADE_SYMBOL, interval=TEST_INTERVAL, limit=100)
         direction, st_line, closes, times = calculate_supertrend_manual(klines, SUPERTREND_PERIOD, SUPERTREND_MULTIPLIER)
         
-        # Аналізуємо закриті свічки
         closed_candle_time = times[-2]
-        
-        # Якщо ми вже обробили цю свічку, чекаємо наступної
         if last_processed_candle_time == closed_candle_time:
             return None
             
-        current_dir = direction[-2] # Осіння закрита свічка
-        prev_dir = direction[-3]    # Передостання закрита свічка
+        current_dir = direction[-2]  
+        prev_dir = direction[-3]     
         
         action = None
-        if prev_dir == -1 and current_dir == 1:
-            action = "BUY"
-        elif prev_dir == 1 and current_dir == -1:
-            action = "SELL"
+        if prev_dir == -1 and current_dir == 1: action = "BUY"
+        elif prev_dir == 1 and current_dir == -1: action = "SELL"
             
         if action:
             last_processed_candle_time = closed_candle_time
             return {"action": action, "price": closes[-2]}
         return None
     except Exception as e:
-        logging.error(f"Помилка в індикаторі: {e}")
+        logging.error(f"Помилка розрахунку індикатора: {e}")
         return None
 
 def execute_spot_trade(side: str):
@@ -99,14 +107,13 @@ def execute_spot_trade(side: str):
         
         if side == "BUY":
             usdc = Decimal(next((a['free'] for a in acc['balances'] if a['asset'] == "USDC"), "0"))
-            # Беремо 99.5% балансу щоб уникнути помилки недостатності коштів через зміну ціни за мілісекунди
             raw_qty = (usdc / curr_price) * Decimal('0.995')
             qty = raw_qty.quantize(Decimal('0.01'), rounding=ROUND_DOWN)
             if qty > 0: 
                 client.create_order(symbol=TRADE_SYMBOL, side="BUY", type="MARKET", quantity=str(qty))
                 save_trade(side, curr_price, qty)
                 return f"✅ Куплено {qty} SOL по ~{curr_price} USDC"
-            return "❌ Недостатньо USDC для покупки"
+            return "❌ Недостатньо USDC на балансі."
             
         else:
             sol = Decimal(next((a['free'] for a in acc['balances'] if a['asset'] == "SOL"), "0"))
@@ -115,63 +122,60 @@ def execute_spot_trade(side: str):
                 client.create_order(symbol=TRADE_SYMBOL, side="SELL", type="MARKET", quantity=str(qty))
                 save_trade(side, curr_price, qty)
                 return f"✅ Продано {qty} SOL по ~{curr_price} USDC"
-            return "❌ Недостатньо SOL для продажу"
+            return "❌ Недостатньо SOL на балансі."
             
     except Exception as e: 
-        return f"❌ Помилка торгівлі: {e}"
+        return f"❌ Помилка виконання ордера на Binance: {e}"
 
-# ФОНОВЕ ЗАВДАННЯ
 async def auto_job(context: ContextTypes.DEFAULT_TYPE):
     data = get_supertrend_signal()
     if data and data.get('action'):
         msg = execute_spot_trade(data['action'])
-        await context.bot.send_message(chat_id=context.job.data['chat_id'], text=f"🚀 Підтверджений сигнал: {data['action']}\n{msg}")
+        await context.bot.send_message(chat_id=context.job.data['chat_id'], text=f"🚀 <b>Підтверджений сигнал: {data['action']}</b>\n\n{msg}", parse_mode="HTML")
 
-# КОМАНДИ МЕНЮ
 async def get_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         acc = client.get_account()
         usdc = float(next((a['free'] for a in acc['balances'] if a['asset'] == "USDC"), 0))
         sol = float(next((a['free'] for a in acc['balances'] if a['asset'] == "SOL"), 0))
-        await update.message.reply_text(f"💳 <b>Ваш Баланс:</b>\n• USDC: <code>{usdc:.2f}</code>\n• SOL: <code>{sol:.4f}</code>", parse_mode="HTML")
-    except Exception as e: await update.message.reply_text(f"Помилка: {e}")
+        await update.message.reply_text(f"💳 <b>Поточний баланс:</b>\n• USDC: <code>{usdc:.2f}</code>\n• SOL: <code>{sol:.4f}</code>", parse_mode="HTML")
+    except Exception as e: 
+        await update.message.reply_text(f"❌ Помилка запиту балансу: {e}")
 
 async def show_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not trade_history:
         await update.message.reply_text("📭 Історія угод порожня.")
         return
     
-    lines = ["📊 <b>Історія ордерів:</b>"]
-    last_price = None
+    lines = ["📊 <b>Історія ордерів та балансу:</b>"]
+    last_val = None
     
     for t in trade_history[-10:]:
         side = t['side']
         price = t['price']
         qty = t['qty']
+        total_usdc = t.get('total_usdc_value', 0.0)
         icon = "🛒" if side == "BUY" else "💰"
         
         diff_str = ""
-        if last_price:
-            diff_pct = ((price - last_price) / last_price) * 100
-            if side == "SELL":
-                color = "🟢" if diff_pct > 0 else "🔴"
-                diff_str = f" {color} {diff_pct:+.2f}%"
-            elif side == "BUY":
-                color = "🟢" if diff_pct < 0 else "🔴" # Купили дешевше = зелений
-                diff_str = f" {color} {diff_pct:+.2f}%"
+        if last_val and total_usdc > 0:
+            diff_usdc = total_usdc - last_val
+            color = "🟢" if diff_usdc >= 0 else "🔴"
+            diff_str = f" ({color} {diff_usdc:+.2f} USDC)"
                 
-        lines.append(f"{icon} <b>{side}</b> {qty} SOL @ {price:.2f}{diff_str}")
-        last_price = price
+        lines.append(f"{icon} <b>{side}</b> {qty} SOL @ {price:.2f} | Депозит: {total_usdc:.2f} USDC{diff_str}")
+        if total_usdc > 0:
+            last_val = total_usdc
         
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def manual_buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Виконую купівлю на весь баланс USDC...")
+    await update.message.reply_text("⏳ Виконую маркет-купівлю на весь баланс USDC...")
     res = execute_spot_trade("BUY")
     await update.message.reply_text(res)
 
 async def manual_sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Виконую продаж всіх SOL...")
+    await update.message.reply_text("⏳ Виконую маркет-продаж всього балансу SOL...")
     res = execute_spot_trade("SELL")
     await update.message.reply_text(res)
 
@@ -180,15 +184,16 @@ async def enable_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auto_trading_enabled:
         auto_trading_enabled = True
         context.job_queue.run_repeating(auto_job, interval=AUTO_TRADE_INTERVAL, first=1, name="st_auto_job", data={"chat_id": update.effective_chat.id})
-        await update.message.reply_text("🚀 Автотрейдинг УВІМКНЕНО!")
+        await update.message.reply_text("🚀 <b>Автотрейдинг за SuperTrend (20, 5.0) УВІМКНЕНО!</b>\nБот сканує щохвилинні закриті свічки.", parse_mode="HTML")
     else:
-        await update.message.reply_text("⚠️ Вже працює.")
+        await update.message.reply_text("⚠️ Автотрейдинг уже запущений.")
 
 async def disable_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global auto_trading_enabled
     auto_trading_enabled = False
-    for job in context.job_queue.get_jobs_by_name("st_auto_job"): job.schedule_removal()
-    await update.message.reply_text("⛔ Автотрейдинг ВИМКНЕНО.")
+    for job in context.job_queue.get_jobs_by_name("st_auto_job"): 
+        job.schedule_removal()
+    await update.message.reply_text("⛔ <b>Автотрейдинг ПОВНІСТЮ ВИМКНЕНО.</b>")
 
 def main():
     load_trade_history()
@@ -200,7 +205,7 @@ def main():
         ["⚡ Увімкнути авто", "⏸ Вимкнути авто"]
     ]
     
-    application.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Бот-Трейдер Готовий! Оберіть дію:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))))
+    application.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("🔷 Робочий спотовий профіль SOL/USDC активовано.", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))))
     
     application.add_handler(MessageHandler(filters.Regex(".*Баланс.*"), get_balance_cmd))
     application.add_handler(MessageHandler(filters.Regex(".*Історія.*"), show_history_cmd))
