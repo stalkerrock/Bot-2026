@@ -12,10 +12,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 client = Client(config.BINANCE_API_KEY, config.BINANCE_SECRET_KEY)
 
 TRADE_SYMBOL = "SOLUSDC"              
-TEST_INTERVAL = Client.KLINE_INTERVAL_1HOUR   # Змінено на 1-годинні свічки
-SUPERTREND_PERIOD = 20                 # Період 20
-SUPERTREND_MULTIPLIER = 5.0           # Множник 5.0
-AUTO_TRADE_INTERVAL = 60              # Перевірка ринку кожні 60 секунд (1 хвилина)
+TEST_INTERVAL = Client.KLINE_INTERVAL_45MINUTE # Змінено на 45-хвилинні свічки
+SUPERTREND_PERIOD = 4                         # Період змінено на 4
+SUPERTREND_MULTIPLIER = 2.0                   # Множник змінено на 2.0
+AUTO_TRADE_INTERVAL = 60                      # Перевірка ринку кожні 60 секунд (1 хвилина)
 PARIS_TZ = pytz.timezone("Europe/Paris")
 TRADE_HISTORY_FILE = "trade_history.json"
 
@@ -53,7 +53,7 @@ def save_trade(side, price, qty):
     except Exception as e:
         logging.error(f"Не вдалося зберегти історію: {e}")
 
-def calculate_supertrend_manual(klines, period=20, multiplier=5.0):
+def calculate_supertrend_manual(klines, period=4, multiplier=2.0):
     highs, lows, closes = [float(k[2]) for k in klines], [float(k[3]) for k in klines], [float(k[4]) for k in klines]
     tr = []
     for i in range(len(closes)):
@@ -184,7 +184,7 @@ async def enable_trading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auto_trading_enabled:
         auto_trading_enabled = True
         context.job_queue.run_repeating(auto_job, interval=AUTO_TRADE_INTERVAL, first=1, name="st_auto_job", data={"chat_id": update.effective_chat.id})
-        await update.message.reply_text("🚀 <b>Автотрейдинг за SuperTrend (20, 5.0) УВІМКНЕНО!</b>\nБот сканує закриті 1-годинні свічки.", parse_mode="HTML")
+        await update.message.reply_text("🚀 <b>Автотрейдинг за SuperTrend (4, 2.0) УВІМКНЕНО!</b>\nБот сканує закриті 45-хвилинні свічки.", parse_mode="HTML")
     else:
         await update.message.reply_text("⚠️ Автотрейдинг уже запущений.")
 
