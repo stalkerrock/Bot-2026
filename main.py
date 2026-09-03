@@ -11,9 +11,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 client = Client(config.BINANCE_API_KEY, config.BINANCE_SECRET_KEY)
 
 TRADE_SYMBOL = "SOLUSDC"              
-TEST_INTERVAL = Client.KLINE_INTERVAL_1MINUTE  
-SUPERTREND_PERIOD = 3                
-SUPERTREND_MULTIPLIER = 1.5        
+TEST_INTERVAL = Client.KLINE_INTERVAL_4HOUR   
+SUPERTREND_PERIOD = 5                
+SUPERTREND_MULTIPLIER = 2.0        
 AUTO_TRADE_INTERVAL = 10              
 PARIS_TZ = pytz.timezone("Europe/Paris")
 TRADE_HISTORY_FILE = "trade_history.json"
@@ -40,7 +40,7 @@ def save_trade(side, price, qty):
     with open(TRADE_HISTORY_FILE, "w") as f:
         json.dump(trade_history, f, indent=4)
 
-def calculate_supertrend_manual(klines, period=5, multiplier=1.5):
+def calculate_supertrend_manual(klines, period=5, multiplier=2.0):
     highs, lows, closes = [float(k[2]) for k in klines], [float(k[3]) for k in klines], [float(k[4]) for k in klines]
     tr = []
     for i in range(len(closes)):
