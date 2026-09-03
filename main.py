@@ -1,21 +1,26 @@
-import logging, json, os, pytz
+import logging, json, os, pytz, time
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 import config
 
 # Налаштування логування для відстеження роботи у Railway
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-client = Client(config.BINANCE_API_KEY, config.BINANCE_SECRET_KEY)
+# Безпечна ініціалізація клієнта (без автоматичного ping при старті)
+try:
+    client = Client(config.BINANCE_API_KEY, config.BINANCE_SECRET_KEY, requests_params={'timeout': 10})
+except Exception as e:
+    logging.error(f"Помилка ініціалізації Binance Client: {e}")
 
 TRADE_SYMBOL = "SOLUSDC"              
-TEST_INTERVAL = Client.KLINE_INTERVAL_45MINUTE # Змінено на 45-хвилинні свічки
-SUPERTREND_PERIOD = 4                         # Період змінено на 4
-SUPERTREND_MULTIPLIER = 2.0                   # Множник змінено на 2.0
-AUTO_TRADE_INTERVAL = 60                      # Перевірка ринку кожні 60 секунд (1 хвилина)
+TEST_INTERVAL = Client.KLINE_INTERVAL_45MINUTE # 45-хвилинні свічки
+SUPERTREND_PERIOD = 4                         # Період 4
+SUPERTREND_MULTIPLIER = 2.0                   # Множник 2.0
+AUTO_TRADE_INTERVAL = 60                      # Перевірка ринку кожні 60 секунд
 PARIS_TZ = pytz.timezone("Europe/Paris")
 TRADE_HISTORY_FILE = "trade_history.json"
 
@@ -96,6 +101,9 @@ def get_supertrend_signal():
             last_processed_candle_time = closed_candle_time
             return {"action": action, "price": closes[-2]}
         return None
+    except BinanceAPIException as e:
+        logging.error(f"Binance API Error (IP Ban / Rate Limit): {e}")
+        return None
     except Exception as e:
         logging.error(f"Помилка розрахунку індикатора: {e}")
         return None
@@ -124,8 +132,10 @@ def execute_spot_trade(side: str):
                 return f"✅ Продано {qty} SOL по ~{curr_price} USDC"
             return "❌ Недостатньо SOL на балансі."
             
+    except BinanceAPIException as e:
+        return f"❌ Помилка Binance API: {e.message} (код {e.code})"
     except Exception as e: 
-        return f"❌ Помилка виконання ордера на Binance: {e}"
+        return f"❌ Помилка виконання ордера: {e}"
 
 async def auto_job(context: ContextTypes.DEFAULT_TYPE):
     data = get_supertrend_signal()
